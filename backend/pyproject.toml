@@ -216,6 +216,14 @@ ignore_missing_imports = true
 module = "pyotp.*"
 ignore_missing_imports = true
 
+# channels ships no py.typed marker/bundled stubs either — same reasoning, scoped to the channels
+# extra (middleware/jwt_auth.py, Phase 9). Surfaced only from Phase 2 onward: mypy couldn't
+# resolve tests.backend.settings (see [tool.django-stubs] below) before this phase's test tree
+# existed, so this module went unchecked until now.
+[[tool.mypy.overrides]]
+module = "channels.*"
+ignore_missing_imports = true
+
 # tasks.py's @shared_task is celery's own untyped decorator (see the override above) — applying
 # it to a fully-typed function is exactly what disallow_untyped_decorators exists to flag, but
 # there is no fix available here short of celery shipping stubs. Scoped to this one module,
@@ -225,13 +233,29 @@ ignore_missing_imports = true
 module = "jwt_multiauth.tasks"
 disallow_untyped_decorators = false
 
+# django-stubs types django.contrib.admin.ModelAdmin as Generic[_ModelT], but the real runtime
+# class only supports ModelAdmin[Foo] subscripting once django_stubs_ext.monkeypatch() has run
+# BEFORE Django's own admin autodiscovery imports this module — something an app package (no
+# manage.py/settings.py of its own to control import order in) cannot arrange for an arbitrary
+# host. Scoped to this one module, which exists only to register plain ModelAdmin classes
+# (docs/CONTRACT.md §5) — strict stays on everywhere else.
+[[tool.mypy.overrides]]
+module = "jwt_multiauth.admin"
+disallow_any_generics = false
+
 # factory-boy ships py.typed but factory.declarations.Sequence/SubFactory (and most other
 # declaration classes) have unannotated __init__ signatures — strict's disallow_untyped_calls
-# then flags every ordinary factories.py usage of them. Scoped to this one module, which exists
-# only to call into that API (APP-DESIGN.md §7.3) — strict stays on everywhere else.
+# then flags every ordinary factories.py usage of them, and DjangoModelFactory is itself an
+# unparameterized Generic in the shipped stubs. (factories.py imports Sequence/SubFactory/
+# LazyFunction from factory.declarations directly, and DjangoModelFactory from factory.django,
+# rather than off the top-level factory/__init__.py re-export — sidesteps strict's
+# no_implicit_reexport entirely, so no override for that is needed here.) Scoped to this one
+# module, which exists only to call into that API (APP-DESIGN.md §7.3) — strict stays on
+# everywhere else.
 [[tool.mypy.overrides]]
 module = "jwt_multiauth.factories"
 disallow_untyped_calls = false
+disallow_any_generics = false
 
 [tool.django-stubs]
 # tests/backend/settings.py doesn't exist until Phase 2 — mypy is not a Phase 1 verification
