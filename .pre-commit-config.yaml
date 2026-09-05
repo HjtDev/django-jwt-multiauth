@@ -1,0 +1,61 @@
+# .pre-commit-config.yaml
+#
+# Local-hooks form (APP-DESIGN.md §3.6), not mirror-pinned repos, for anything whose config
+# depends on this project's own environment (mypy's Django plugin/stubs, ruff's uv.lock-resolved
+# version). Tool versions come from uv.lock / package-lock.json, never a pinned `rev` — so
+# pre-commit and CI can never disagree about which formatter is authoritative.
+#
+# The `cd` in every local entry is load-bearing: `uv run --project backend mypy` sets
+# environment resolution but not the working directory, so mypy would look for config in the
+# repo root, find none, and run *without* `strict`, the Django plugin, or
+# `django_settings_module` — passing while checking almost nothing.
+#
+# The frontend hooks (eslint, prettier) are listed now but inert until Phase 10 creates
+# `frontend/` — `files: ^frontend/` means they never match before then.
+repos:
+  - repo: local
+    hooks:
+      - id: ruff
+        name: ruff
+        entry: bash -c 'cd backend && uv run ruff check --fix .'
+        language: system
+        types_or: [python, pyi]
+        files: ^backend/
+        pass_filenames: false
+      - id: ruff-format
+        name: ruff-format
+        entry: bash -c 'cd backend && uv run ruff format .'
+        language: system
+        types_or: [python, pyi]
+        files: ^backend/
+        pass_filenames: false
+      - id: mypy
+        name: mypy
+        entry: bash -c 'cd backend && uv run mypy src'
+        language: system
+        files: ^backend/src/
+        pass_filenames: false
+        require_serial: true
+      - id: eslint
+        name: eslint
+        entry: bash -c 'cd frontend && npx eslint --fix src'
+        language: system
+        files: ^frontend/
+        pass_filenames: false
+      - id: prettier
+        name: prettier
+        entry: bash -c 'cd frontend && npx prettier --write src'
+        language: system
+        files: ^frontend/
+        pass_filenames: false
+  # Only environment-independent hooks stay as pinned mirrors.
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-added-large-files
+      - id: detect-private-key
+      - id: check-yaml
+      - id: check-toml

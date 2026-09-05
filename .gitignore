@@ -57,7 +57,7 @@ coverage/
 *.pot
 # ...except this app's own shipped catalogue — a wheel consumer can't run compilemessages, so
 # the compiled .mo must be committed (APP-DESIGN.md §2's "package data must be declared" note).
-!backend/src/dynamic_user/locale/**/*.mo
+!backend/src/jwt_multiauth/locale/**/*.mo
 
 # Django stuff:
 *.log

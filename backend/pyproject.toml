@@ -1,0 +1,278 @@
+[build-system]
+# setuptools-scm deliberately NOT included here (APP-DESIGN.md §3.1 declares it but never wires
+# it up — no `dynamic = ["version"]`, no [tool.setuptools_scm] table — so it would be dead
+# weight, and it would fight CLAUDE.md's "pyproject.toml/package.json/CHANGELOG.md agree" rule
+# once all three files exist). Verified against app packages #1 (appkit), #2 (cleanup_app), and
+# #3 (django-dynamic-user)'s own shipped pyproject.toml, all three of which made the same call.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# "django-jwt-multiauth", not "jwt-multiauth" — the IMPORTABLE module stays `jwt_multiauth`
+# everywhere (INSTALLED_APPS, every import, AppConfig.name) exactly like appkit ships
+# `hjtdev-appkit` / `import appkit` and django-dynamic-user ships `django-dynamic-user` /
+# `import dynamic_user`. docs/CONTRACT.md §0.
+name = "django-jwt-multiauth"
+# Kept in lockstep with frontend/package.json and CHANGELOG.md's own heading, once both exist —
+# CI's version-lockstep job enforces all three agreeing (this repo's CLAUDE.md "Both halves at
+# the same version, in all three places" rule).
+version = "1.0.0"
+description = "JWT authentication layer for a host Django project, as an installable app package."
+# Points at THIS directory's own README.md, not the repo-root one one level up — setuptools
+# reads `readme` relative to pyproject.toml, and a monorepo's sdist build has no reliable access
+# to files outside its own project root (build isolation may operate on a copy of just this
+# directory). backend/README.md is therefore a committed, generated COPY of the root README
+# (`make sync-readmes`), not hand-maintained prose of its own. Wired now, with a placeholder
+# copy, rather than deferred — omitting `readme` entirely is what shipped three real appkit
+# releases with an empty, unfixable PyPI description before anyone noticed (docs/CONTRACT.md's
+# own citation of appkit's docs/CONTRACT.md §22).
+readme = "README.md"
+requires-python = ">=3.13"
+license = "MIT"
+license-files = ["LICENSE"]
+
+# Wide ranges on anything a host also depends on directly (django/drf/drf-spectacular) — see
+# APP-DESIGN.md §1.1. hjtdev-appkit is a declared-dependency exception to the no-inter-app-import
+# rule (CONTRACT.md §0's mechanical test: is it in [project.dependencies]? yes), not a sibling
+# app package. pyjwt is app-private but still a range, never `==`, per the same rule — this app
+# owns token issuance/verification directly rather than depending on
+# djangorestframework-simplejwt (docs/CONTRACT.md §0). Exactly docs/CONTRACT.md §9's five ranges
+# — hjtdev-appkit verified live against PyPI (version 2.0.2, `provides_extra: ["crypto",
+# "images"]`), confirming the `totp` extra's `hjtdev-appkit[crypto]` reference below is real.
+dependencies = [
+    "django>=5.2,<7.0",
+    "djangorestframework>=3.15,<4.0",
+    "drf-spectacular>=0.27,<1.0",
+    "hjtdev-appkit>=2.0,<3.0",
+    "pyjwt>=2.9,<3.0",
+]
+
+# A TOML subtable, not a plain key — MUST come after every bare [project] key above
+# (dependencies included). A subtable header implicitly closes the parent table to further bare
+# keys, so placing this any earlier silently nests dependencies/optional-dependencies under
+# [project.urls] instead of [project] (APP-DESIGN.md §3.1's own warning about this exact trap).
+[project.urls]
+Homepage = "https://github.com/HjtDev/django-jwt-multiauth"
+Repository = "https://github.com/HjtDev/django-jwt-multiauth"
+Changelog = "https://github.com/HjtDev/django-jwt-multiauth/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/HjtDev/ecosystem-docs/blob/main/APP-DESIGN.md"
+
+# Extras = features a CONSUMER opts into, installed with django-jwt-multiauth[totp] /
+# [channels] / [celery]. None is required for the app to be fully functional against its own
+# defaults (ALLOWED_AUTH_METHODS=["password"], TWO_FACTOR.POLICY="off") — docs/CONTRACT.md §9.
+# "totp" pulls in Pillow-free crypto via appkit's own "crypto" extra rather than depending on
+# `cryptography` directly, mirroring django-dynamic-user's "avatar" extra re-exporting appkit's
+# "images" extra — confirmed live against appkit's published pyproject.toml/PyPI metadata:
+# appkit's crypto extra is spelled "crypto", not "encryption" or "fernet".
+[project.optional-dependencies]
+totp = ["pyotp>=2.9,<3.0", "hjtdev-appkit[crypto]>=2.0,<3.0"]
+channels = ["channels>=4.1,<5.0"]
+celery = ["celery[redis]>=5.4,<6.0", "django-celery-beat>=2.7,<3.0"]
+
+# PEP 735 groups = tooling for developing THIS package. Never installed by a consumer, never
+# published, not visible to a host at all.
+[dependency-groups]
+dev = [
+    "ruff>=0.12",
+    "mypy>=1.14",
+    "django-stubs[compatible-mypy]>=5.1",
+    "djangorestframework-stubs>=3.15",
+    "pre-commit>=4.0",
+]
+test = [
+    "pytest>=8.3",
+    "pytest-django>=4.9",
+    "pytest-cov>=6.0",
+    "pytest-xdist>=3.6",
+    "factory-boy>=3.3",
+    # >=3.2.10, not just >=3.2: psycopg-binary only started shipping cp314 wheels at 3.2.10, and
+    # .python-version pins 3.14 — same floor appkit's and django-dynamic-user's own
+    # pyproject.toml use (APP-DESIGN.md §7.5: tests run on Postgres).
+    "psycopg[binary]>=3.2.10",
+    # OTP/token TTL tests need controllable time — see checks.py/conf.py's TTL-driven settings
+    # and tokens.py's exp claims, none of which are testable deterministically against wall time.
+    "freezegun>=1.5",
+    # Contributor-only, never installed by a host: the totp extra's `cryptography` dependency is
+    # what Phase 2+'s TOTP-secret-encryption tests need present regardless of whether a given test
+    # run selected the extra — mirrors django-dynamic-user's own reasoning for carrying "pillow"
+    # in [test] alongside its "avatar" extra.
+    "cryptography>=42,<51",
+]
+
+[tool.uv]
+default-groups = ["dev", "test"]     # `uv sync` gives a contributor everything
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# Belt and braces alongside MANIFEST.in: package-data is what actually lands package data in the
+# built WHEEL (MANIFEST.in only governs the sdist). Missing this would silently ship a wheel with
+# no type hints and no admin templates, even with MANIFEST.in and include-package-data = true
+# both present — the exact gap appkit's own pyproject.toml closes for py.typed, extended here
+# (per django-dynamic-user's own precedent) to also cover this app's templates/ and static/.
+[tool.setuptools.package-data]
+jwt_multiauth = [
+    "py.typed",
+    "templates/**/*",
+    "static/**/*",
+    "locale/*/LC_MESSAGES/*.po",
+    "locale/*/LC_MESSAGES/*.mo",
+]
+
+# ---------------------------------------------------------------- ruff
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "../tests"]
+# backend/README.md (the readme-sync copy above) sits inside this directory — `ruff format`
+# reformats Python code fences inside Markdown files by default, and without this exclude it
+# rewrites the README's own example config blocks to satisfy a formatter meant for src/ and
+# tests/, not narrative documentation (APP-DESIGN.md §3.1's own note on this exact trap).
+extend-exclude = ["README.md"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",     # pycodestyle
+    "F",          # pyflakes
+    "I",          # isort
+    "UP",         # pyupgrade
+    "B",          # bugbear
+    "DJ",         # flake8-django
+    "S",          # bandit — security; this app holds credentials, so this ruleset is load-bearing
+    "TID",        # tidy-imports (used to enforce the boundary rules below)
+    "RUF",
+]
+ignore = ["S101"]  # assert is fine in tests
+
+[tool.ruff.lint.per-file-ignores]
+"../tests/**" = ["S", "TID251"]
+# "*/migrations/*" alone only matches ONE path segment before "migrations" — it covers this
+# package's own src/jwt_multiauth/migrations/ but not a nested test-host app's migrations dir
+# two segments deep relative to either configured src root (django-dynamic-user hit exactly
+# this once its own test tree grew swapped-model host apps). Every generated migration file is
+# Black/ruff-unformatted by design (`makemigrations` doesn't run a formatter), so all three
+# patterns are kept, not just the deepest one.
+"*/migrations/*" = ["E501", "RUF012"]
+"**/migrations/*" = ["E501", "RUF012"]
+"../tests/**/migrations/*" = ["E501", "RUF012"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "parents"
+
+# --- Host modules (APP-DESIGN.md §4): an app package can't assume a host's internals exist at a
+# stable import path. Names verified against appkit's, cleanup_app's, and django-dynamic-user's
+# own banned-api blocks, all checked against a real host (base-scaffold/backend/): config, core,
+# tools.
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"tools".msg = "jwt_multiauth must never import host modules — APP-DESIGN.md §4."
+"core".msg = "jwt_multiauth must never import host modules — APP-DESIGN.md §4."
+"config".msg = "jwt_multiauth must never import host modules — APP-DESIGN.md §4."
+
+# --- Sibling app packages. django-jwt-multiauth is app package #4 — ecosystem-docs/APPS.md
+# lists exactly appkit, hjtdev-django-cleanup/cleanup_app, and django-dynamic-user/dynamic_user
+# as of this writing, so both non-appkit siblings are banned below. Add one line per NEW app as
+# each is created:
+#   "<app>_app".msg = "App packages must never import each other — see APP-DESIGN.md §6."
+#
+# appkit is NEVER added here — it's a declared dependency ([project.dependencies] above), not a
+# sibling app package the rule exists to keep out (APP-DESIGN.md §1.1's mechanical test).
+"cleanup_app".msg = "App packages must never import each other — see APP-DESIGN.md §6."
+"dynamic_user".msg = "App packages must never import each other — see APP-DESIGN.md §6."
+
+# Factories are a test-only surface (APP-DESIGN.md §7.3). This works in an app repo because the
+# test tree lives outside src/ and is cleanly exempted above (per-file-ignores) — a host project
+# can't do the same, see BASE-DESIGN.md §5.2.
+"jwt_multiauth.factories".msg = "factories.py is test-only — see APP-DESIGN.md §7.3."
+
+# ---------------------------------------------------------------- mypy
+[tool.mypy]
+python_version = "3.13"
+strict = true
+plugins = ["mypy_django_plugin.main", "mypy_drf_plugin.main"]
+warn_unreachable = true
+exclude = ["migrations/"]
+# NOT in APP-DESIGN.md §3.1's example. Without it, [tool.django-stubs]'s
+# django_settings_module = "tests.backend.settings" is unresolvable when mypy runs from backend/
+# (the settings module lives one level up, outside src/) and `uv run mypy src` fails — verified
+# against appkit's, cleanup_app's, and django-dynamic-user's own pyproject.toml, all of which
+# carry this same fix with the same comment.
+mypy_path = "..:src"
+
+[[tool.mypy.overrides]]
+module = "*.migrations.*"
+ignore_errors = true
+
+# celery ships no py.typed marker and no bundled stubs on PyPI — a real gap in an optional
+# dependency (the celery extra), not something a local ignore comment should paper over.
+[[tool.mypy.overrides]]
+module = "celery.*"
+ignore_missing_imports = true
+
+# pyotp ships no py.typed marker either — same reasoning, scoped to the totp extra.
+[[tool.mypy.overrides]]
+module = "pyotp.*"
+ignore_missing_imports = true
+
+# tasks.py's @shared_task is celery's own untyped decorator (see the override above) — applying
+# it to a fully-typed function is exactly what disallow_untyped_decorators exists to flag, but
+# there is no fix available here short of celery shipping stubs. Scoped to this one module,
+# which exists only to define the celery-extra tasks (docs/CONTRACT.md §8) — strict stays on
+# everywhere else.
+[[tool.mypy.overrides]]
+module = "jwt_multiauth.tasks"
+disallow_untyped_decorators = false
+
+# factory-boy ships py.typed but factory.declarations.Sequence/SubFactory (and most other
+# declaration classes) have unannotated __init__ signatures — strict's disallow_untyped_calls
+# then flags every ordinary factories.py usage of them. Scoped to this one module, which exists
+# only to call into that API (APP-DESIGN.md §7.3) — strict stays on everywhere else.
+[[tool.mypy.overrides]]
+module = "jwt_multiauth.factories"
+disallow_untyped_calls = false
+
+[tool.django-stubs]
+# tests/backend/settings.py doesn't exist until Phase 2 — mypy is not a Phase 1 verification
+# gate for exactly that reason (mirrors django-dynamic-user's own Phase 1). The setting is wired
+# now so Phase 2 needs no further pyproject.toml changes to make `uv run mypy src` pass.
+django_settings_module = "tests.backend.settings"
+
+# ---------------------------------------------------------------- pytest (see APP-DESIGN.md §7)
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "tests.backend.settings"
+pythonpath = ["src", ".."]
+testpaths = ["../tests/backend"]
+python_files = ["test_*.py"]
+# `-p appkit.testing` opts into appkit's shared appkit_api_client/appkit_user/appkit_admin_user/
+# appkit_auth_client/appkit_admin_client/appkit_frozen_request_id/appkit_clear_cache/
+# appkit_assert_error_envelope fixtures (appkit ships no pytest11 entry point deliberately, so
+# every consumer opts in explicitly).
+#
+# This is the ONE place this file deliberately does NOT copy appkit's own pyproject.toml:
+# appkit's addopts carries a hard "DO NOT add -p appkit.testing" comment, because a plugin
+# loaded via `-p` in addopts imports during pytest's early consider_preparse phase, before
+# pytest-cov's tracer attaches — coverage.py then permanently misreports that module (and
+# everything it imports at module scope) as "previously imported but not measured". That bit
+# appkit because its own suite measures --cov=appkit, and -p appkit.testing imports appkit's OWN
+# code before the tracer attaches. Here coverage measures --cov=jwt_multiauth, and
+# appkit.testing imports nothing from jwt_multiauth — the early-import artefact has no
+# jwt_multiauth-measured module to land on, so it cannot reproduce that failure mode. Same
+# reasoning django-dynamic-user's own pyproject.toml already applied for the same dependency.
+#
+# --cov-fail-under=90, not the ecosystem's usual 85: CLAUDE.md's own coverage-gate row raises the
+# bar for this app specifically, because it holds credentials.
+addopts = """
+  -ra --strict-markers --strict-config -p appkit.testing
+  --cov=jwt_multiauth --cov-report=term-missing --cov-fail-under=90
+"""
+markers = [
+    "slow: excluded from the default run, opt in with -m slow",
+    "integration: crosses a real DB/broker boundary rather than mocking it",
+    "requires_extra: needs the totp and/or channels and/or celery extra installed — deselected on the bare-install leg (-m 'not requires_extra', per this repo's CLAUDE.md commands table)",
+]
+filterwarnings = ["error::DeprecationWarning"]
+
+[tool.coverage.run]
+omit = ["*/migrations/*", "*/tests/*"]
