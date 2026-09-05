@@ -96,7 +96,8 @@ Read this once; every phase prompt below assumes it.
 | npm package | **`@hjtdev/django-jwt-multiauth`** — verified free on npm at the time this guide was written; scoped, matching every other frontend SDK in this ecosystem |
 | GitHub repo | `HjtDev/django-jwt-multiauth` |
 | Namespacing (`APP-DESIGN.md` §1.2) | settings dict `JWT_MULTIAUTH` (nested sub-dicts, see §1's settings table below); throttle prefix `jwt_multiauth_` (admin: `jwt_multiauth_admin_`) — **hardcoded string constants in `throttling.py`, never `appkit.throttling.throttle_scope()`**, because that helper raises `ValueError` if either argument contains an underscore, and `jwt_multiauth` itself contains one; cache namespace `jwt_multiauth`; Celery task names `jwt_multiauth.tasks.*`; **two** frontend basePath keys — `jwt_multiauth` → `/api/v1/auth` (self-service) and `jwt_multiauth_admin` → `/api/v1/admin/auth` (admin), same two-surface shape `django-dynamic-user` already established in this ecosystem |
-| Scope | Authentication only: login (three methods), password reset, 2FA, sessions, lockout, audit log. No profile/settings/avatar/deletion — `django-dynamic-user`'s job. No delivery of anything — this app emits `phone_otp_requested`/`email_otp_requested` and a host wires them to Twilio/SES/whatever, exactly the signal-mediator pattern `APP-DESIGN.md` §6 describes |
+| Scope | Authentication only: login (three methods), password reset, 2FA, sessions, lockout, audit log. No profile/settings/avatar/deletion — `django-dynamic-user`'s job. No delivery of anything — this app emits `phone_otp_requested`/`email_otp_requested` and a host wires them to Twilio/SES/whatever, exactly the signal-mediator pattern `APP-DESIGN.md` §6 describes. One narrow exception, added at Phase 3 (`docs/CONTRACT.md` §11 item 19): account *creation* — never profile data — for a phone/email-OTP identifier nobody has seen before, opt-in per method via `USER_FIELDS["AUTO_PROVISION_METHODS"]` |
+| Auto-provisioning | Opt-in per method (`USER_FIELDS["AUTO_PROVISION_METHODS"]`, default `[]`). An unresolved identifier on a listed method persists a real `OtpChallenge` (`user=None`) instead of a decoy; a successful verify `get_or_create`s the account (`UserProvisioningService`, `docs/CONTRACT.md` §4), sets only the proven contact field (+ `USERNAME_FIELD` if distinct and empty) and an unusable password, then logs the user straight in. `TWO_FACTOR.POLICY != "off"` never blocks this — the 2FA-bootstrap carve-out (§10) is scoped to `created=True` in that same request only. Everything past account creation — name, avatar, deletion — stays `django-dynamic-user`'s job, which is being updated in parallel to accept an account created this way |
 | JWT layer | **PyJWT directly** (`pyjwt>=2.9,<3.0`), not `djangorestframework-simplejwt`. `tokens.py` owns claim construction/verification; `AuthSession` (this app's own model) supersedes simplejwt's `token_blacklist` app for rotation/reuse-detection, so a host never gets `rest_framework_simplejwt.token_blacklist` forced into `INSTALLED_APPS`. Also: simplejwt 5.5.1 (latest at time of writing) declares no Django 6 classifier, a live risk against this app's own `django>=5.2,<7.0` range |
 | Refresh transport | **HttpOnly, Secure, SameSite cookie by default** (`REFRESH_COOKIE["TRANSPORT"]="cookie"`); a `"body"` mode exists for native/non-browser clients. Access token is never persisted anywhere — issued in the response body, held in JS memory only on the frontend (Phase 10) |
 | 2FA | Optional, policy-driven (`off`/`opt_in`/`required`/`staff_only`), method allowlist (`totp`/`email_otp`/`phone_otp`/`recovery_code`), and a **mandatory different-channel rule**: the second factor can never be the same channel as the primary login method. If a user's enrolled methods, intersected with the allowlist and that rule, come up empty, login fails with `two_factor_unavailable` — it never degrades to single-factor |
@@ -136,6 +137,13 @@ Read this once; every phase prompt below assumes it.
   is revoked immediately (`refresh_reuse_detected` fires), not just the offending token, on the
   standard assumption that reuse means the token was stolen and the legitimate holder's copy is now
   worthless anyway.
+- **An unresolved identifier is not always a decoy.** For a method in
+  `USER_FIELDS["AUTO_PROVISION_METHODS"]`, `OtpService.request()` persists a real, `user=None`
+  challenge instead — the account may not exist yet, but the challenge is genuine and a successful
+  `verify()` creates the account and logs the user straight in (`docs/CONTRACT.md` §11 item 19).
+  This is a *stronger* enumeration-resistance property than a pure decoy, not a weaker one: for an
+  auto-provisioning-enabled method, a known and an unknown identifier are indistinguishable at every
+  point in the flow, because both end in a real login.
 
 ---
 
@@ -513,17 +521,32 @@ services.py's OtpService, built on otp.py + OtpChallenge + conf.get_otp_setting:
   depending on channel and PasswordService's own identifier rules from Phase 6). If the user
   resolves: honor SINGLE_ACTIVE_CHALLENGE (invalidate any prior unconsumed challenge for the same
   user+purpose+channel), create the row, fire the matching *_otp_requested signal with the
-  PLAINTEXT code. If the user does NOT resolve: perform hash_secret on a throwaway value anyway (so
-  the CPU cost is comparable), generate a fresh uuid4 as a decoy challenge_id, and return an
-  IDENTICAL OtpRequestResult shape — no database row, no signal fired, nothing sent. Write the test
-  that proves this by mocking both the DB insert and the signal and asserting NEITHER happens on
-  the decoy path, while the return value is indistinguishable in shape from the real path.
+  PLAINTEXT code. If the user does NOT resolve AND the method (the channel, mapped through §0's
+  channel->method table) is NOT in USER_FIELDS.AUTO_PROVISION_METHODS: perform hash_secret on a
+  throwaway value anyway (so the CPU cost is comparable), generate a fresh uuid4 as a decoy
+  challenge_id, and return an IDENTICAL OtpRequestResult shape — no database row, no signal fired,
+  nothing sent. Write the test that proves this by mocking both the DB insert and the signal and
+  asserting NEITHER happens on the decoy path, while the return value is indistinguishable in
+  shape from the real path. If the user does NOT resolve AND the method IS in
+  AUTO_PROVISION_METHODS (docs/CONTRACT.md §11 item 19 — a new requirement, added after this
+  phase's original prompt was written): persist a REAL OtpChallenge with user=None and fire the
+  matching *_otp_requested signal with the real code, same as the resolves-to-a-user path in every
+  other respect — the identifier may become a real account when verify() runs. Write a test proving
+  THIS path, for an AUTO_PROVISION_METHODS-listed channel, is indistinguishable in response shape
+  from the resolves-to-a-user path (not from the decoy path — those two are now different for this
+  channel), and that it DOES write a row and DOES fire the signal.
 - verify(challenge_id, *, code=None, link_token=None) -> OtpVerifyResult(user, purpose): looks up
   by challenge_id (a decoy challenge_id simply won't be found — same NotFound-shaped failure as a
   real-but-expired one, don't leak the distinction). Enforces expires_at, attempts < max_attempts
   (incrementing attempts on every failed compare, locking the challenge out after max_attempts
   regardless of whether the LAST attempt would have been correct), consumed_at is None. Uses
-  verify_secret for the actual compare. On success: consumed_at = now, fire otp_verified.
+  verify_secret for the actual compare. On success, for a row whose user is not None: consumed_at =
+  now, fire otp_verified. On success, for a row whose user IS None (an AUTO_PROVISION_METHODS
+  challenge that never resolved at request-time, per the new bullet above): call
+  UserProvisioningService.get_or_create(destination, field=...) (docs/CONTRACT.md §4/§11 item 19),
+  attach the resulting user to this OtpChallenge row, THEN consumed_at = now, fire otp_verified AND
+  user_provisioned. Either way the caller gets back an OtpVerifyResult with a real user — Phase 6's
+  login view doesn't need to know which branch produced it.
 - resend(challenge_id) -> OtpRequestResult: enforces RESEND_COOLDOWN_SECONDS and MAX_RESENDS,
   reuses the same challenge_id and destination but a freshly generated code/hash and expires_at.
 
@@ -535,7 +558,10 @@ request test per the above. attempts lockout test (max_attempts reached rejects 
 subsequently-correct code). resend cooldown and max-resends tests. A purpose-override test proving
 password_reset's TTL/length differ from login's on the same channel when configured to. A test
 proving generate_code with exclude_ambiguous=True and a tiny custom alphabet that would go empty
-raises ImproperlyConfigured rather than looping or crashing. Run pytest, paste coverage.
+raises ImproperlyConfigured rather than looping or crashing. With AUTO_PROVISION_METHODS set for a
+channel: request() on an unknown identifier persists a real row and fires the signal (not the decoy
+path); verify() on that challenge creates exactly one new user via UserProvisioningService, attaches
+it to the OtpChallenge, and fires both otp_verified and user_provisioned. Run pytest, paste coverage.
 ```
 
 **Verify:** the decoy-path test passes and genuinely asserts zero DB writes and zero signal
@@ -629,11 +655,16 @@ and the GET /methods/ discovery endpoint (wherever CONTRACT.md placed it), plus 
 all of them.
 
 Shared login-response shape used by BOTH views_password.py and views_otp.py's verify endpoint (a
-single helper, not two copies): given a user, request_meta, and remember_me, call
-TwoFactorService.eligible_methods(user, used_primary_channel=...). Empty list -> issue tokens
-directly via TokenService.issue_token_pair, set the refresh cookie (name/attributes from
-REFRESH_COOKIE settings) or include it in the body per REFRESH_COOKIE.TRANSPORT, return
-{access, session_id}. Non-empty list -> issue a pending_2fa token via
+single helper, not two copies): given a user, request_meta, remember_me, and created (bool — False
+from views_password.py's own login, since password never auto-provisions; from
+OtpVerifyResult.created for views_otp.py's verify, docs/CONTRACT.md §11 item 19), call
+TwoFactorService.eligible_methods(user, used_primary_channel=...) UNLESS created is True, in which
+case skip straight to the token-issuing branch below regardless of what eligible_methods would
+return — this is the 2FA-bootstrap carve-out (§10): a user provisioned in this same request has no
+enrolled factor to be unavailable FOR. Empty list (or created=True) -> issue tokens directly via
+TokenService.issue_token_pair, set the refresh cookie (name/attributes from REFRESH_COOKIE
+settings) or include it in the body per REFRESH_COOKIE.TRANSPORT, return
+{access, session_id, created}. Non-empty list (and created=False) -> issue a pending_2fa token via
 TokenService.issue_pending_2fa_token, return {pending_token, eligible_methods} — HTTP 200, this is
 not an error response, appkit's error envelope must never wrap it.
 
@@ -658,7 +689,7 @@ Every view, without exception:
   not accept a phone_otp request even for a real phone-having user.
 - POST /otp/verify/: unauthenticated. Accepts EITHER code OR link_token (never both required) —
   this is where the magic-link variant lives, not a separate view. Success runs through the SAME
-  shared login-response helper as /login/.
+  shared login-response helper as /login/, passing OtpVerifyResult.created through unchanged.
 - POST /otp/resend/: unauthenticated.
 - GET /methods/: unauthenticated, no throttle beyond a generous default (it's read-only, static per
   deployment) — returns ALLOWED_AUTH_METHODS and TWO_FACTOR's policy/allowed-methods, nothing
@@ -678,7 +709,12 @@ it's off; a full login -> eligible 2FA methods -> (Phase 7 will complete this ha
 just assert the pending_token/eligible_methods shape, not a full round trip) test under a
 TWO_FACTOR-enabled settings override. One test per throttle scope. phone_otp specific tests run
 ONLY under settings_dynamic_user; assert /otp/request/ with channel="phone" 400s under default
-settings (phone_otp isn't in that module's ALLOWED_AUTH_METHODS). Run pytest and paste coverage.
+settings (phone_otp isn't in that module's ALLOWED_AUTH_METHODS). With AUTO_PROVISION_METHODS set
+AND TWO_FACTOR.POLICY="required": a full /otp/request/ -> /otp/verify/ round trip for a brand-new
+identifier returns real tokens with created: true, never a pending_2fa response — proving the
+2FA-bootstrap carve-out actually fires; a second login by an EXISTING user with no enrolled factor,
+same settings, still gets the ordinary TwoFactorUnavailable/401 — proving the carve-out is scoped
+to created=True and nothing broader. Run pytest and paste coverage.
 
 Then generate the schema: DJANGO_SETTINGS_MODULE=tests.backend.settings uv run python manage.py
 spectacular --file schema.yml --fail-on-warn, and commit schema.yml.
@@ -796,7 +832,11 @@ views_session.py: GET /sessions/ (auth, paginated via appkit.pagination.DefaultP
 the CALLER's own AuthSession rows only — never another user's, checked at the queryset level, not
 just by permission class), DELETE /sessions/{id}/ (auth, IsObjectOwner-style ownership check before
 revoking — a user must never be able to revoke a session by guessing another user's session id).
-Throttle scopes jwt_multiauth_sessions_list, _sessions_revoke.
+Throttle scopes jwt_multiauth_sessions_list, _sessions_revoke. ALSO in this file (docs/CONTRACT.md
+§11 item 2, added after this phase's original prompt was written — don't skip these, §11 item 18
+flags this exact gap): GET /trusted-devices/ (auth, paginated, CALLER's own TrustedDevice rows
+only), DELETE /trusted-devices/{id}/ (auth, same ownership-check pattern as sessions). Throttle
+scopes jwt_multiauth_trusted_devices_list, _trusted_devices_revoke.
 
 views_account.py: POST /account/verify-contact/request/ (auth, body: field), POST
 /account/verify-contact/confirm/ (auth, body: challenge_id, code). Throttle scopes
@@ -814,6 +854,9 @@ admin_views.py, every view using the admin gate above, a namespaced throttle_sco
   appkit.validation.validate_query_params + safe_filter_kwargs — never raw **request.GET into a
   filter() call).
 - DELETE /admin/sessions/{id}/ (any user's session).
+- GET /admin/trusted-devices/ (paginated, filterable by user — docs/CONTRACT.md §11 item 2, same
+  gap §11 item 18 flags for the self-service pair above; don't skip it here either).
+- DELETE /admin/trusted-devices/{id}/ (any user's trusted device).
 - GET /admin/login-attempts/ (paginated, filterable by identifier/ip/user/success).
 - GET /admin/users/{id}/security/ (2fa status, active session count, current lock status — a
   read-only aggregate view, no model of its own).
@@ -821,12 +864,34 @@ admin_views.py, every view using the admin gate above, a namespaced throttle_sco
 - POST /admin/users/{id}/2fa/force-disable/ (is_superuser-only regardless of
   ADMIN_REQUIRES_SUPERUSER; calls TwoFactorService.admin_force_disable).
 
+Django admin gains three actions it didn't have at Phase 2 (docs/CONTRACT.md §11 item 18 — every
+admin capability needs BOTH a REST endpoint and a Django-admin surface; these three couldn't be
+written until the services above existed):
+- admin.py's TrustedDeviceAdmin gains a "Revoke selected trusted devices" action, same
+  loop-and-call-TokenService-equivalent pattern as AuthSessionAdmin.revoke_sessions — never a raw
+  queryset .update(), so the ordinary per-row service call still runs (there's no dedicated signal
+  for this one, but the point is calling through the service, not bypassing it).
+- admin.py's TwoFactorDeviceAdmin gains a "Force-disable 2FA" action, is_superuser-only via the
+  SAME always-on check permissions.py just added for the REST route — never the configurable
+  ADMIN_REQUIRES_SUPERUSER gate. Calls TwoFactorService.admin_force_disable, never deletes the row
+  directly (a raw delete would skip the service and never fire two_factor_disabled).
+- admin.py's LoginAttemptAdmin (or a small addition to the User admin, whichever reads more
+  naturally — decide and note which) gains an "Unlock" action calling LockoutService.unlock. Lock
+  state is an appkit.cache counter, not a model row, so this action resolves an identifier from the
+  selected LoginAttempt row(s) rather than acting on a lock "object" that doesn't exist.
+
 Tests, against both settings modules, and against BOTH ADMIN_REQUIRES_SUPERUSER=False and =True for
 every admin view except force-disable-2fa (which is tested ONLY as superuser-required,
-unconditionally): every self-service session/account view enforces ownership (a second user's
-attempt to DELETE /sessions/{id}/ against the first user's session id 403s or 404s — pick one and
-justify it, then test it); every admin view 403s a non-admin; force-disable-2fa 403s a plain staff
-(non-superuser) admin even when ADMIN_REQUIRES_SUPERUSER=False. Run pytest, paste coverage.
+unconditionally): every self-service session/account/trusted-device view enforces ownership (a
+second user's attempt to DELETE /sessions/{id}/ or /trusted-devices/{id}/ against the first user's
+row id 403s or 404s — pick one and justify it, then test it); every admin view 403s a non-admin
+(sessions and trusted-devices both); force-disable-2fa 403s a plain staff (non-superuser) admin even
+when ADMIN_REQUIRES_SUPERUSER=False. Django-admin actions, against a real ModelAdmin instance the
+same way test_admin.py's Phase 2 tests do: TrustedDeviceAdmin's revoke action actually revokes (a
+subsequent rotate/use of that device's token fails afterward); TwoFactorDeviceAdmin's force-disable
+action is superuser-only (assert a staff-but-not-superuser request denied, mirroring the REST
+route's own test) and fires two_factor_disabled, never a raw queryset delete; the unlock action
+calls LockoutService.unlock with the right identifier. Run pytest, paste coverage.
 
 Regenerate schema.yml now that every surface exists; commit it.
 ```

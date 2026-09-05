@@ -1,11 +1,14 @@
 """HKDF derivation for ``JWT_MULTIAUTH_SIGNING_KEY``/``JWT_MULTIAUTH_OTP_PEPPER`` when unset, and
 the loud, actionable error for a required-but-absent ``JWT_MULTIAUTH_ENCRYPTION_KEY``.
 
-Three ``.env`` keys, per ``docs/CONTRACT.md`` §6:
+Four ``.env`` keys, per ``docs/CONTRACT.md`` §6:
 
 * ``JWT_MULTIAUTH_SIGNING_KEY`` — optional. HKDF-derived from ``settings.SECRET_KEY`` when
   unset. Fine as-is for ``HS256`` (this app's default algorithm); a host running ``RS256``
   overrides it with a real private key.
+* ``JWT_MULTIAUTH_VERIFYING_KEY`` — optional. Falls back to :func:`get_signing_key` when unset —
+  correct for ``HS256``, where one symmetric key both signs and verifies. A host running
+  ``RS256`` sets this to the public key matching its ``JWT_MULTIAUTH_SIGNING_KEY`` private key.
 * ``JWT_MULTIAUTH_OTP_PEPPER`` — optional. HKDF-derived from ``settings.SECRET_KEY`` when unset,
   with a **different** ``info`` string than the signing key's — the two derived values are
   cryptographically independent of each other despite sharing a root secret. Fed into
@@ -82,6 +85,23 @@ def get_signing_key() -> str:
     if configured:
         return str(configured)
     return _hkdf_sha256(_root_secret(), _SIGNING_KEY_INFO).hex()
+
+
+def get_verifying_key() -> str:
+    """The key ``tokens.decode`` verifies a signature against: the host's own
+    ``JWT_MULTIAUTH_VERIFYING_KEY`` if set, otherwise :func:`get_signing_key`. Unlike
+    :func:`get_encryption_key`, this one HAS a fallback by design — for ``TOKENS["ALGORITHM"] =
+    "HS256"`` (this app's default), the same symmetric key both signs and verifies, so falling
+    back to :func:`get_signing_key` is simply correct, not a compromise. A host running
+    ``"RS256"`` sets ``JWT_MULTIAUTH_SIGNING_KEY`` to a private key and MUST also set
+    ``JWT_MULTIAUTH_VERIFYING_KEY`` to the matching public key — without this function, "RS256-
+    ready" would be a lie, since there would be no way to verify with anything other than the
+    private key ``get_signing_key`` returns.
+    """
+    configured = getattr(settings, "JWT_MULTIAUTH_VERIFYING_KEY", None)
+    if configured:
+        return str(configured)
+    return get_signing_key()
 
 
 def get_otp_pepper() -> str:

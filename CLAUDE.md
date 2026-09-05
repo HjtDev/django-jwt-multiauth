@@ -80,7 +80,7 @@ own and stay real files here.
 
 | In | Out |
 |---|---|
-| Password login + password change + password reset (via OTP challenge), phone-OTP login, email-OTP login, magic-link login (an OTP challenge's link-token form) | Registration/signup, profile fields, avatars, account-deletion — `django-dynamic-user`'s job |
+| Password login + password change + password reset (via OTP challenge), phone-OTP login, email-OTP login, magic-link login (an OTP challenge's link-token form). Account **creation** for a phone/email-OTP identifier nobody has seen before, but only when its method is opted into `USER_FIELDS["AUTO_PROVISION_METHODS"]` (default: no methods are) — sets the one proven contact field and an unusable password, nothing else | Registration/signup as a *feature* (a signup form, a "create account" flow), profile fields, avatars, account-deletion — `django-dynamic-user`'s job. Auto-provisioning is a side effect of a successful OTP login, not a signup surface this app exposes |
 | Refresh-token rotation, reuse detection, session listing/revocation (self-service + admin) | Anything resembling a general-purpose session/cache store — sessions here mean auth sessions only |
 | Optional 2FA: TOTP, email-OTP, phone-OTP, and recovery codes as second factors, with a policy toggle (`off`/`opt_in`/`required`/`staff_only`) and a different-channel rule | Authenticator-app UI, QR rendering — the backend returns an `otpauth://` URI; rendering the QR is the frontend/host's job |
 | Login-attempt audit log, IP/account lockout, trusted-device (skip-2FA) cookies | Notification delivery of any kind — this app only emits `phone_otp_requested`/`email_otp_requested` signals; wiring them to Twilio/SES/whatever is the host's or a notification-app's job |
@@ -144,8 +144,8 @@ shared workflow).
 - Removing/renaming a signal (`phone_otp_requested`, `email_otp_requested`, `otp_verified`,
   `contact_verified`, `user_logged_in`, `user_logged_out`, `login_failed`, `account_locked`,
   `password_changed`, `two_factor_enabled`, `two_factor_disabled`, `refresh_reuse_detected`,
-  `session_revoked`), a `services.py` method signature, an exported hook, or a field a host might
-  query on any of this app's models.
+  `session_revoked`, `user_provisioned`), a `services.py` method signature, an exported hook, or a
+  field a host might query on any of this app's models.
 - Renaming a `JWT_MULTIAUTH` settings key (top-level or inside any of its sub-dicts —
   `TOKENS`/`REFRESH_COOKIE`/`OTP`/`TWO_FACTOR`/`LOCKOUT`/`PASSWORD`/`USER_FIELDS`) or the
   `ALLOWED_AUTH_METHODS` top-level key.

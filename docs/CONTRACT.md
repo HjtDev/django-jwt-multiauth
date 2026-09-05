@@ -81,10 +81,13 @@ from django.db import models
 
 
 class OtpChallenge(models.Model):
-    """A single OTP/magic-link challenge. Real challenges (identifier resolved) are persisted;
-    decoy challenges (identifier did not resolve) are NEVER persisted — see §5's enumeration-
-    resistance note and §11 item 11. user is nullable in the schema for that reason alone: a real
-    row always has a user, and no code path in this app ever creates a row with user=None."""
+    """A single OTP/magic-link challenge. For a method NOT in `USER_FIELDS.AUTO_PROVISION_METHODS`,
+    an unresolved identifier is a decoy — nothing is ever persisted, see §5's enumeration-resistance
+    note. For a method IN that list, an unresolved identifier persists a REAL row with user=None —
+    the account doesn't exist yet, but the challenge is genuine and may create one at verify time
+    (§4's UserProvisioningService, §11 item 19). Either way user=None never means "decoy"; it means
+    "not yet resolved to an account", and OtpService.verify() treats a decoy and a real-but-expired
+    challenge identically (§10) regardless of which reason produced the null."""
 
     challenge_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(
@@ -415,6 +418,12 @@ session_revoked = django.dispatch.Signal()
 the reuse-detection and password-changed paths, which both call through revoke_session/
 revoke_all_sessions rather than duplicating the revoke logic. sender=AuthSession.
 Payload: session_id: str, user_id: int, reason: str"""
+
+user_provisioned = django.dispatch.Signal()
+"""Sent by UserProvisioningService.get_or_create() the moment it creates a NEW user — never for an
+existing one. sender=get_user_model(). How a host triggers a welcome message, or hands off to
+django-dynamic-user for profile completion (§11 item 19).
+Payload: user_id: int, field: str, value: str"""
 ```
 
 **Minimality argument, per field:**
@@ -435,6 +444,9 @@ Payload: session_id: str, user_id: int, reason: str"""
   the receiver a still-partially-useful secret to mishandle.
 - `session_revoked` carries `reason` as the literal `AuthSession.revoked_reason` choice string, so
   a host doesn't have to re-query the row to know why.
+- `user_provisioned` carries `field`/`value` (which contact field, and what it was set to) rather
+  than a `User` instance — the same "primitives/IDs only" rule as every other signal, and enough
+  for a host receiver to compose a welcome message without a second query.
 
 **Requires another app package: No.**
 
@@ -450,7 +462,17 @@ job, not this document's.
 # jwt_multiauth/services.py (excerpt — signatures and exceptions only)
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, TypedDict
+
+
+class RequestMeta(TypedDict, total=False):
+    """Per-request metadata TokenService needs for AuthSession bookkeeping and audit signals —
+    `ip`/`method` are required in practice wherever a method actually reads them (§11 item 17)."""
+
+    ip: str
+    user_agent: str
+    device_label: str
+    method: str
 
 
 class TwoFactorUnavailable(Exception):
@@ -470,6 +492,13 @@ class RefreshReuseDetected(Exception):
     session is already revoked by the time this is raised. Views map this to 401."""
 
 
+class InvalidRefreshToken(Exception):
+    """Raised by TokenService.rotate_refresh() for a malformed/expired/wrong-typ refresh token, or
+    a session that is revoked or expired. Views map this to 401. NOT raised for reuse — see
+    RefreshReuseDetected (§11 item 17 — the guide's "InvalidPendingToken-shaped rejection" phrase
+    named the wrong exception; a refresh failure must not be named for the pending-2FA flow)."""
+
+
 class ChallengeInvalid(Exception):
     """Raised by OtpService.verify() for a challenge_id that doesn't resolve, is expired, is
     already consumed, or has exhausted max_attempts. Deliberately the SAME exception (and the same
@@ -482,7 +511,9 @@ class TokenPair:
     access: str
     refresh: str
     session_id: str
-    expires_at: datetime
+    expires_at: datetime  # the ACCESS token's own expiry, not the session's (§11 item 17) —
+    # AuthSession.expires_at (readable via GET /sessions/) is the session's own lifetime;
+    # the frontend token manager (Phase 10) needs THIS one to schedule its next refresh.
 
 
 @dataclass(frozen=True)
@@ -496,6 +527,9 @@ class OtpRequestResult:
 class OtpVerifyResult:
     user: Any  # AbstractBaseUser — never a concrete import
     purpose: str
+    created: bool  # True only when THIS call provisioned the user (§11 item 19) — the shared
+    # login-response helper (§5 Phase 6) reads this to apply the 2FA-bootstrap carve-out (§10)
+    # and to set the response's own created field. False on every non-auto-provisioning path.
 
 
 @dataclass(frozen=True)
@@ -512,17 +546,25 @@ class TotpEnrollment:
 
 class TokenService:
     @staticmethod
-    def issue_token_pair(user: Any, *, request_meta: dict, remember_me: bool = False) -> TokenPair:
+    def issue_token_pair(
+        user: Any, *, request_meta: RequestMeta, remember_me: bool = False
+    ) -> TokenPair:
         """Creates a new AuthSession row and issues a fresh access+refresh pair. Fires
-        user_logged_in with the real session_id. Never raises under normal operation."""
+        user_logged_in with the real session_id and request_meta["method"] (§11 item 17 — the
+        signal's payload needs `method` and this signature is otherwise frozen, so it travels
+        inside request_meta rather than as a new parameter). Never raises under normal
+        operation."""
         ...
 
     @staticmethod
-    def rotate_refresh(raw_refresh_token: str, *, request_meta: dict) -> TokenPair:
+    def rotate_refresh(raw_refresh_token: str, *, request_meta: RequestMeta) -> TokenPair:
         """Raises RefreshReuseDetected if the presented jti is not the session's current_jti (the
-        session is revoked as part of raising, not after). Raises InvalidPendingToken-shaped
-        rejection (session revoked/expired/malformed) otherwise on any non-happy path. On success:
-        rotates jti, increments rotation_count, issues a fresh pair, same session_id throughout."""
+        session is revoked as part of raising, not after). Raises InvalidRefreshToken for a
+        malformed/expired/wrong-typ token, or a revoked/expired session (§11 item 17), checked
+        BEFORE the jti comparison so a stale token replayed against an already-dead session never
+        re-fires refresh_reuse_detected. On success: rotates jti, increments rotation_count,
+        issues a fresh pair, same session_id throughout — the refresh token's own TTL is clamped
+        to the session's remaining lifetime, so rotating never extends it (§11 item 17)."""
         ...
 
     @staticmethod
@@ -543,7 +585,9 @@ class TokenService:
         ...
 
     @staticmethod
-    def issue_pending_2fa_token(user: Any, *, primary_method: str, request_meta: dict) -> str:
+    def issue_pending_2fa_token(
+        user: Any, *, primary_method: str, request_meta: RequestMeta
+    ) -> str:
         """typ='pending_2fa', short TTL from TWO_FACTOR.PENDING_TOKEN_TTL_SECONDS. Carries
         primary_method as a claim so verify_second_factor can enforce the different-channel rule
         without a second database round trip."""
@@ -560,11 +604,16 @@ class OtpService:
     def request(identifier: str, *, channel: str, purpose: str) -> OtpRequestResult:
         """If identifier resolves to a real user for the given channel: honors
         SINGLE_ACTIVE_CHALLENGE, persists the row, fires the matching *_otp_requested signal with
-        the plaintext code. If identifier does NOT resolve: computes an equivalent HMAC on a
+        the plaintext code. If identifier does NOT resolve AND the method (§0's channel->method
+        mapping) is NOT in USER_FIELDS.AUTO_PROVISION_METHODS: computes an equivalent HMAC on a
         throwaway value (comparable CPU cost), returns an IDENTICAL OtpRequestResult shape with a
-        fresh decoy uuid4 challenge_id — no database row, no signal. Never raises for an unknown
-        identifier; the fail-closed rule (§0 item 3) applies to CREDENTIALS, not to whether an
-        identifier exists, which is exactly what rule 5 protects."""
+        fresh decoy uuid4 challenge_id — no database row, no signal. If identifier does NOT
+        resolve AND the method IS in AUTO_PROVISION_METHODS: persists a REAL OtpChallenge with
+        user=None and fires the matching *_otp_requested signal with the real code — identical
+        response shape either way, but this path now has a genuine row and a genuine signal behind
+        it (§11 item 19), since the identifier may become a real account at verify() time. Never
+        raises for an unknown identifier; the fail-closed rule (§0 item 3) applies to CREDENTIALS,
+        not to whether an identifier exists, which is exactly what rule 5 protects."""
         ...
 
     @staticmethod
@@ -573,13 +622,37 @@ class OtpService:
         expired, already consumed, or attempts >= max_attempts (checked BEFORE the compare, so
         attempt max_attempts+1 is rejected even if it would have been correct). Uses
         otp.verify_secret (constant-time) for the actual compare; increments attempts on every
-        failed compare. On success: consumed_at=now, fires otp_verified."""
+        failed compare. On success, for a row with user IS NOT None: consumed_at=now, fires
+        otp_verified, returns OtpVerifyResult(user, purpose, created=False). On success, for a row
+        with user IS None (an auto-provisioned method's previously-unresolved identifier, §11 item
+        19): calls UserProvisioningService.get_or_create(destination, field=...), attaches the new
+        user to this OtpChallenge row, THEN consumed_at=now, fires otp_verified and
+        user_provisioned, returns OtpVerifyResult(user, purpose, created=True) — the caller (§5's
+        login view) reads OtpVerifyResult.created to decide whether the 2FA-bootstrap carve-out
+        (§10) and the response's own created field apply."""
         ...
 
     @staticmethod
     def resend(challenge_id: str) -> OtpRequestResult:
         """Raises ChallengeInvalid if the cooldown hasn't elapsed or MAX_RESENDS is exhausted.
         Reuses the same challenge_id/destination; generates a fresh code/hash/expires_at."""
+        ...
+
+
+class UserProvisioningService:
+    """§11 item 19 — implemented in Phase 4 (called from OtpService.verify), specified here.
+    Never imports a concrete user model; every field write goes through
+    get_user_model()/USER_FIELDS resolution, same as every other service in this module."""
+
+    @staticmethod
+    def get_or_create(identifier: str, *, field: str) -> tuple[Any, bool]:
+        """field is "phone" or "email" — whichever USER_FIELDS entry identifier was resolved
+        against. Returns (user, created). If USER_FIELDS.PROVISION_CALLBACK is set, calls it and
+        returns whatever it returns — the host owns every field on the created user. Otherwise:
+        sets the named field to identifier, sets the model's USERNAME_FIELD to identifier too if
+        it's a different, still-empty field, calls set_unusable_password(). Never touches a field
+        this app doesn't itself own — no name, no avatar, no profile anything. Fires
+        user_provisioned only when a new row was actually created, never for an existing one."""
         ...
 
 
@@ -755,12 +828,12 @@ states the mechanism, not just "yes."
 
 | Method | Path | Permission | Throttle scope | Enum-resistant | Request → Response |
 |---|---|---|---|---|---|
-| `POST` | `/login/` | `AllowAny` | `jwt_multiauth_login` | Yes — `LockoutService.is_locked` checked first (reject before touching credentials at all if locked); otherwise `PasswordService.authenticate`'s dummy-hash path makes unknown-identifier and wrong-password identical. `401` either way, same body | `{identifier, password, remember_me?}` → `200 {access, session_id}` (no 2FA) or `200 {pending_token, eligible_methods}` (2FA required) — **never wrapped in appkit's error envelope**, this is not an error response |
+| `POST` | `/login/` | `AllowAny` | `jwt_multiauth_login` | Yes — `LockoutService.is_locked` checked first (reject before touching credentials at all if locked); otherwise `PasswordService.authenticate`'s dummy-hash path makes unknown-identifier and wrong-password identical. `401` either way, same body | `{identifier, password, remember_me?}` → `200 {access, session_id, created: false}` (no 2FA) or `200 {pending_token, eligible_methods}` (2FA required) — **never wrapped in appkit's error envelope**, this is not an error response. `created` is always `false` here — `password` is never an `AUTO_PROVISION_METHODS` entry (§11 item 19) — present anyway so the shared login-response shape never differs by which endpoint produced it |
 | `POST` | `/password/change/` | `IsAuthenticated` | `jwt_multiauth_password_change` | N/A (authenticated) | `{old_password, new_password}` → `204`, or `400` (wrong old_password / validator failure) |
 | `POST` | `/password/reset/request/` | `AllowAny` | `jwt_multiauth_password_reset_request` | Yes — `PasswordService.request_reset` always returns; view always responds `200` | `{identifier}` → `200 {}` unconditionally |
 | `POST` | `/password/reset/confirm/` | `AllowAny` | `jwt_multiauth_password_reset_confirm` | Yes — an unresolved/expired/decoy `challenge_id` all produce the identical `ChallengeInvalid` → `400` | `{challenge_id, code? or link_token?, new_password}` → `204`, or `400` |
 | `POST` | `/otp/request/` | `AllowAny` | `jwt_multiauth_otp_request` | Yes — `OtpService.request`'s identical-shape decoy path (§4); also rejects (`400`, not 401/404) a channel not in `ALLOWED_AUTH_METHODS` for purpose="login" | `{identifier, channel}` → `200 {challenge_id, expires_at, resend_available_at}` (real or decoy, indistinguishable), or `400` (channel not allowed) |
-| `POST` | `/otp/verify/` | `AllowAny` | `jwt_multiauth_otp_verify` | Yes — same `ChallengeInvalid` shape for decoy/expired/wrong-code | `{challenge_id, code? or link_token?}` (exactly one required, magic-link lives here, not a separate view) → same login-response shape as `/login/`, or `400` |
+| `POST` | `/otp/verify/` | `AllowAny` | `jwt_multiauth_otp_verify` | Yes — same `ChallengeInvalid` shape for decoy/expired/wrong-code | `{challenge_id, code? or link_token?}` (exactly one required, magic-link lives here, not a separate view) → same login-response shape as `/login/`, or `400`. `created: true` when this call just provisioned a new account (§11 item 19) — the ONE case where this shared shape's `created` can be `true` |
 | `POST` | `/otp/resend/` | `AllowAny` | `jwt_multiauth_otp_resend` | Yes — same `ChallengeInvalid` shape whether the challenge is real, decoy, or cooldown-blocked | `{challenge_id}` → `200 {challenge_id, expires_at, resend_available_at}`, or `400` |
 | `POST` | `/token/refresh/` | `AllowAny` (reads the refresh cookie/body) | `jwt_multiauth_token_refresh` | N/A | — → `200 {access, session_id}`, re-sets cookie; `401` on reuse/expired/revoked (`refresh_reuse_detected` fires on reuse) |
 | `POST` | `/token/verify/` | `AllowAny` (token is a body param — lets another service validate a token it received) | `jwt_multiauth_token_verify` | N/A | `{token}` → `200 {valid: true, claims}` or `200 {valid: false}` |
@@ -861,6 +934,8 @@ later phase implements `POLICY`, not `ENABLED`; there is no `ENABLED` key in thi
 | `USER_FIELDS.EMAIL_FIELD` | `None` | Required (checks.py error) iff `"email_otp"` is in `ALLOWED_AUTH_METHODS` or `TWO_FACTOR.ALLOWED_METHODS` |
 | `USER_FIELDS.PHONE_FIELD` | `None` | Required (checks.py error) iff `"phone_otp"` is in either list above |
 | `USER_FIELDS.IDENTIFIER_FIELDS` | `["username", "email"]` | Order `PasswordService.authenticate` tries when resolving a login identifier (§11 item 5 — named by the guide's Phase 5, missing from its settings list) |
+| `USER_FIELDS.AUTO_PROVISION_METHODS` | `[]` | Per-method opt-in list, drawn from `phone_otp`/`email_otp` only (never `password`) — an unresolved identifier on a listed method is `get_or_create`d into a real account instead of decoyed. Empty default: zero behavior change for every existing host (§11 item 19) |
+| `USER_FIELDS.PROVISION_CALLBACK` | `None` | Dotted path to a host callable `(identifier: str, field: str) -> user` that fully owns creation for an `AUTO_PROVISION_METHODS` method; unset uses the built-in default (§4's `UserProvisioningService`, §11 item 19) |
 
 **Interactions:**
 
@@ -870,13 +945,23 @@ later phase implements `POLICY`, not `ENABLED`; there is no `ENABLED` key in thi
   `TwoFactorUnavailable`, login fails outright — never degrades to single-factor (rule 3).
 - `TWO_FACTOR.POLICY != "off"` and `"totp"` in `ALLOWED_METHODS` but `JWT_MULTIAUTH_ENCRYPTION_KEY`
   is unset → `checks.py` error (guide Phase 1 step 6).
+- `USER_FIELDS.AUTO_PROVISION_METHODS` is non-empty, no `PROVISION_CALLBACK` is set, and the
+  resolved user model has a `REQUIRED_FIELDS` entry the built-in default can't fill → `checks.py`
+  error (`jwt_multiauth.E007`), never a runtime `500` on someone's first login (rule 2, §11 item 19).
+- A user auto-provisioned via `AUTO_PROVISION_METHODS` and `TWO_FACTOR.POLICY != "off"` → the
+  narrow 2FA-bootstrap carve-out applies (§10), never the ordinary `TwoFactorUnavailable` fail-closed
+  path — see §11 item 19.
 
 `.env` keys: **one conditionally required**, `JWT_MULTIAUTH_ENCRYPTION_KEY` (Fernet key via
 `appkit.crypto.generate_key()`) — required only when `TWO_FACTOR.POLICY != "off"` and `"totp"` is
 in `TWO_FACTOR.ALLOWED_METHODS`, and **never** derived from `SECRET_KEY` even as a convenience
 default. Two optional, HKDF-derived from `SECRET_KEY` when unset: `JWT_MULTIAUTH_SIGNING_KEY`,
 `JWT_MULTIAUTH_OTP_PEPPER` (distinct HKDF `info` strings, so the two derived values are
-cryptographically independent of each other despite sharing a root secret).
+cryptographically independent of each other despite sharing a root secret). A fourth,
+`JWT_MULTIAUTH_VERIFYING_KEY` — optional, falls back to `JWT_MULTIAUTH_SIGNING_KEY`'s own resolved
+value when unset (correct for the default `"HS256"`, where one symmetric key both signs and
+verifies); a host running `"RS256"` sets this to the public key matching its
+`JWT_MULTIAUTH_SIGNING_KEY` private key (Phase 3, §11 item 17).
 
 **Requires another app package: No.**
 
@@ -1076,14 +1161,25 @@ server-side and rejects (`TwoFactorUnavailable`) a client-claimed `method` not i
 computed set — a client is never trusted to self-report which method it satisfied.
 `TrustedDevice` is the one documented, intentional bypass: its cookie is checked **before** 2FA is
 even offered, and it is itself a hashed bearer secret with its own revocation surface (§1, §5) —
-not a silent downgrade, a deliberate, revocable, auditable skip.
+not a silent downgrade, a deliberate, revocable, auditable skip. **The 2FA-bootstrap carve-out
+(§11 item 19) is the second, deliberately narrow one:** a user `UserProvisioningService` just
+created, in the SAME request, has no enrolled factor to check `eligible_methods` against at all —
+issuing real tokens for them is not "no token before 2FA," it's "no 2FA exists yet for an account
+that didn't exist a moment ago." The narrowness is the whole point: an EXISTING user with zero
+enrolled factors under `POLICY="required"` still fails closed exactly as before — this carve-out
+triggers only on `created is True` from the very call that produced it, never retroactively.
 
 **Enumeration resistance is proven per identifier-taking endpoint** (§5's Enum-resistant column),
 via one of two mechanisms: (a) a dummy constant-time hash computation on the no-such-identifier
 path (`PasswordService.authenticate`), or (b) an identical-shape decoy response with zero
-persistence and zero signal dispatch (`OtpService.request`). `OtpService.verify` collapses "no such
-challenge_id" (real or decoy) and "expired" and "already consumed" into the single `ChallengeInvalid`
-exception, so a client can never distinguish "this was a decoy" from "this expired."
+persistence and zero signal dispatch (`OtpService.request`) — **or, for a method in
+`USER_FIELDS.AUTO_PROVISION_METHODS` (§11 item 19), an identical-shape response with a REAL,
+persisted row instead of a decoy**, since the identifier may become a real account at `verify()`
+time; the property strengthens rather than weakens, because there is then no observable difference
+at all between a known and an unknown identifier anywhere in the flow. `OtpService.verify` collapses
+"no such challenge_id" (real or decoy) and "expired" and "already consumed" into the single
+`ChallengeInvalid` exception, so a client can never distinguish "this was a decoy" from "this
+expired."
 
 **`LOCKOUT.LOCK_SCOPE`'s trade-off, stated explicitly (§11 item 10):** `"identifier"` alone lets
 one malicious IP lock out an arbitrary victim account by repeatedly failing their username from
@@ -1177,12 +1273,16 @@ Everything not listed here is unchanged from
     trade-off of `"identifier"`-alone stated explicitly** — directly answering this guide's own
     Phase 0 review gate about `LOCK_SCOPE`. See §10 for the full argument. All three modes
     (`"identifier"`, `"ip"`, `"identifier_and_ip"`) are implemented; none is silently dropped.
-11. **`OtpChallenge.user` is nullable in the schema but never actually null in v1.0.0.** The
-    guide's item 1 specifies nullable *and* that nothing ever persists a decoy row — both are true
-    simultaneously: the field allows it structurally (so a future purpose needing an unresolved-
-    user row isn't blocked at the schema level) but no code path in this app ever writes
-    `user=None`. Recorded explicitly so a later phase doesn't "helpfully" start writing decoy rows,
-    which would defeat the whole point of the decoy design (§4, §10).
+11. **`OtpChallenge.user` is nullable in the schema; whether v1.0.0 ever writes `user=None` depends
+    entirely on `USER_FIELDS.AUTO_PROVISION_METHODS` — narrowed by item 19 below, not superseded.**
+    The guide's item 1 specifies nullable *and* that nothing ever persists a decoy row for the
+    DEFAULT configuration (`AUTO_PROVISION_METHODS = []`): the field allows null structurally, but
+    no code path writes `user=None` when auto-provisioning is off everywhere. Once a host opts a
+    method into `AUTO_PROVISION_METHODS` (item 19), `user=None` becomes a real, intentional state —
+    "not yet resolved to an account" — not a decoy. What must never happen, under any
+    configuration: a *decoy* row (an identifier that will NEVER resolve, computed on the no-such-
+    identifier path) getting persisted. That distinction — real-but-unresolved vs. decoy-and-never-
+    persisted — is the thing a later phase must not blur.
 12. **appkit's `crypto` extra name verified as literally `crypto`, not assumed** — read directly
     from `appkit/backend/pyproject.toml`'s `[project.optional-dependencies]` (`crypto`, `images`
     are the only two). appkit is at 2.0.2 on both halves as of this writing.
@@ -1233,6 +1333,97 @@ Everything not listed here is unchanged from
       about `TWO_FACTOR.POLICY`) — corrected to point here. The actual reason
       `appkit.throttling.throttle_scope()` is unusable is that it raises `ValueError` on any
       argument containing an underscore, and `jwt_multiauth` has one.
+17. **Phase 3 decisions, made because §4 as written left them unresolved:**
+    - **`request_meta` is a `RequestMeta` TypedDict**, not a bare `dict` — mypy `strict`'s
+      `disallow_any_generics` rejects an unparameterized `dict`, and there is no per-module
+      override for `jwt_multiauth.services`. Keys: `ip`, `user_agent`, `device_label`, `method`,
+      all `str`, `total=False`. `ip`/`method` are required in practice by a private `_require()`
+      helper wherever a `TokenService` method actually reads them — a missing one raises
+      `ValueError` (a caller bug, not a host-facing failure).
+    - **`method` travels inside `request_meta`, not as a new parameter.** `user_logged_in`'s
+      payload (§3) needs `method: str`, but `issue_token_pair`'s signature is frozen with no such
+      parameter — adding one would be the exact signature change §4's own preamble defers to a
+      later phase without a `Host action:` line. Riding inside `request_meta` costs nothing new at
+      the call boundary.
+    - **`InvalidRefreshToken` is a new exception**, not `InvalidPendingToken` read literally. §4's
+      original text called `rotate_refresh`'s non-reuse failure "`InvalidPendingToken`-shaped,"
+      but raising the pending-2FA flow's own exception name for a refresh failure is misleading in
+      a traceback and to any host catching it by name.
+    - **`keys.get_verifying_key()` is added**, falling back to `get_signing_key()` when
+      `JWT_MULTIAUTH_VERIFYING_KEY` is unset — correct for the default `HS256` (one symmetric key
+      both signs and verifies). `tokens.decode` calls this, `tokens.issue` still calls
+      `get_signing_key()` — the two diverge only under `RS256`. Unlike `get_encryption_key()`, this
+      one has a fallback by design, not by oversight.
+    - **`tokens.py`'s exception names**: `TokenError` (base), `TokenExpired`,
+      `TokenSignatureInvalid`, `TokenMalformed` (a well-formed-but-missing-a-required-claim token
+      counts as malformed, not a fourth category), `TokenTypeMismatch`.
+    - **`TokenPair.expires_at` is the ACCESS token's own expiry**, not the session's — §4 didn't
+      say. The frontend token manager (Phase 10) needs this one to schedule its next refresh;
+      `AuthSession.expires_at` (via `GET /sessions/`) already answers "how long can this session
+      live at all."
+    - **Rotation never extends session lifetime.** `AuthSession.expires_at` is set once at
+      `issue_token_pair` and never moved; every issued refresh token's own TTL is clamped to
+      whatever time remains until that fixed boundary — the fail-closed reading of a spec silent on
+      this point.
+    - **`rotate_refresh` checks revoked/expired BEFORE the jti comparison.** The guide enumerates
+      reuse and revoked-or-expired as separate outcomes but never orders them. Checking
+      revoked/expired first means a stale token replayed against a session a prior reuse already
+      killed returns the ordinary `InvalidRefreshToken` instead of re-firing
+      `refresh_reuse_detected` on every retry; the first reuse still detects correctly, since the
+      session is live at that point.
+18. **Every admin capability gets both a Django-admin surface and a REST endpoint — confirmed with
+    the user.** Found while planning Phase 3: trusted-device revoke, force-disable-2FA, and lockout
+    release each already had a REST route specified (§5) with no Django-admin equivalent, and — the
+    gap that actually blocks Phase 8 — §5's `GET`/`DELETE /trusted-devices/[{id}/]` and their admin
+    pair (added by item 2 above) were never added to the guide's own Phase 8 prompt text, which
+    still names only sessions/login-attempts/security/unlock/force-disable. The guide's Phase 8
+    prompt is corrected to list all four trusted-device routes and the three missing admin actions
+    (`TrustedDeviceAdmin` revoke, `TwoFactorDeviceAdmin` force-disable — superuser-only, mirroring
+    the REST route's own unconditional gate — and a `LoginAttemptAdmin`/user-changelist unlock
+    action, since lockout state is an `appkit.cache` counter with no model of its own). None of
+    these three is implemented before Phase 8 — the services they need
+    (`TwoFactorService.admin_force_disable`, `LockoutService.unlock`) don't exist until Phases 5
+    and 7.
+19. **OTP auto-provisioning ("login with an unrecognized phone/email creates the account") —
+    confirmed with the user; specified here, implemented in Phases 4 and 6, not this phase.**
+    `django-dynamic-user` is being updated in parallel to accept an account created this way, so
+    this app's side of the contract is frozen now rather than left to drift.
+    - **Opt-in, per method, empty by default** — `USER_FIELDS.AUTO_PROVISION_METHODS` (§6), drawn
+      from `phone_otp`/`email_otp` only. Empty default: zero behavior change for every host that
+      never sets it, exactly today's decoy semantics.
+    - **`UserProvisioningService.get_or_create(identifier: str, *, field: str) -> tuple[Any, bool]`**
+      (§4, new service). Resolution order: (1) `USER_FIELDS.PROVISION_CALLBACK`, a dotted path to a
+      host callable `(identifier, field) -> user`, if set — the host owns every field; (2) else the
+      built-in default — set the field named by `USER_FIELDS.PHONE_FIELD`/`.EMAIL_FIELD` to
+      `identifier`, set the model's `USERNAME_FIELD` to `identifier` too if it's a different,
+      still-empty field (this is what makes stock `django.contrib.auth.User` work, since `username`
+      is its `USERNAME_FIELD` and a phone number is a valid unique value for it), then
+      `set_unusable_password()`. Never touches a field this app doesn't own — no name, no avatar,
+      no profile anything; that stays `django-dynamic-user`'s job (`CLAUDE.md`'s scope table,
+      amended to say so precisely rather than leave it contradicting this).
+    - **`jwt_multiauth.E007`** — a `REQUIRED_FIELDS` entry the built-in default can't fill, with no
+      `PROVISION_CALLBACK` set, is a `manage.py check` error, never a first-login `500` (rule 2).
+    - **Enumeration resistance is re-stated, not weakened.** For a method in
+      `AUTO_PROVISION_METHODS`, `OtpService.request()` persists a REAL `OtpChallenge` with
+      `user=None` for an unresolved identifier — the first code path that ever writes that null,
+      narrowing item 11 above rather than contradicting it: `user=None` means "not yet resolved,"
+      never "decoy." There is no observable difference, at any point in the flow, between a known
+      and an unknown identifier on an auto-provision-enabled method, because both end in a real
+      login — a stronger property than today's, not a weaker one. A method NOT on the list keeps
+      today's decoy path untouched.
+    - **The 2FA-bootstrap carve-out (§10).** A user auto-provisioned in the current request has no
+      enrolled factor, so `TWO_FACTOR.POLICY != "off"`'s ordinary fail-closed path would lock them
+      out of the account just created for them. When `created is True` in the SAME request: issue
+      real tokens, flag enrollment as outstanding in the response (`OtpVerifyResult`/login response
+      gains no new frozen field yet — Phase 6 wires the actual response shape). Deliberately as
+      narrow as possible: an EXISTING user with no enrolled factors under `POLICY="required"` still
+      fails closed, exactly as today. The second documented exception to "no token before 2FA,"
+      alongside `TrustedDevice`.
+    - **What creation records and emits**: a `VerifiedContact` row for the field just proven (the
+      OTP is the proof; re-verifying the same value would be theatre); the `OtpChallenge`'s `user`
+      FK filled in at verify time, linking the audit trail to the account it produced; a new
+      `user_provisioned` signal (§3); `created: true` surfaced in the verify/login response so a
+      frontend can route to onboarding instead of the dashboard.
 
 ---
 
