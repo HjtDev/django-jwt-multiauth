@@ -1,0 +1,169 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+# lib/ and lib64/ deliberately REMOVED from this boilerplate: this repo's own Python venvs
+# nest everything under .venv/ (already ignored below), so a bare, unscoped `lib/` here would
+# silently match a real, hand-written TypeScript source directory once frontend/lib/ exists
+# (Phase 7) — same trap appkit and cleanup_app hit and fixed for the same reason.
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+#  Usually these files are written by a python script from a template
+#  before PyInstaller builds the exe, so as to inject date/other infos into it.
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+coverage/
+
+# Translations
+*.mo
+*.pot
+# ...except this app's own shipped catalogue — a wheel consumer can't run compilemessages, so
+# the compiled .mo must be committed (APP-DESIGN.md §2's "package data must be declared" note).
+!backend/src/dynamic_user/locale/**/*.mo
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# Shared design docs — symlinked from a sibling ../ecosystem-docs checkout via `make docs-link`,
+# never held as a local copy. See ecosystem-docs/README.md and this repo's own CLAUDE.md.
+docs/APP-DESIGN.md
+docs/BASE-DESIGN.md
+docs/INTEGRATION-GUIDE.md
+docs/CLAUDE-CODE-GUIDE-APP.md
+docs/CLAUDE-CODE-GUIDE-BASE.md
+
+# PyBuilder
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+# NOT ignoring .python-version here — this repo commits it deliberately
+# (APP-DESIGN.md §3.3: it pins what `uv` provisions locally, separate from the
+# `requires-python` range in pyproject.toml).
+
+# pipenv
+#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
+#   However, in case of collaboration, if having platform-specific dependencies or dependencies
+#   having no cross-platform support, pipenv may install dependencies that don't work, or not
+#   install all needed dependencies.
+#Pipfile.lock
+
+# celery beat schedule file
+celerybeat-schedule
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# Pycharm
+.idea/
+
+# ruff
+.ruff_cache/
+
+# node
+node_modules/
+
+# backend/uv.lock is COMMITTED, never ignored — APP-DESIGN.md §3.4: it pins CI and the
+# playground only, and never travels downstream to a consuming host. Same for
+# playground/backend/uv.lock once the playground exists (Phase 8).
+
+# playground/ — Phase 8, docs/APP-DESIGN.md §11.2. Runtime state and generated output only;
+# playground/package-lock.json and playground/backend/uv.lock ARE committed, same reasoning as
+# backend/uv.lock above.
+.next/
+next-env.d.ts
+*.tsbuildinfo
+playground/*/backend/media/
+playground/*/backend/staticfiles/
+
+# graphify — regenerable output and hardcodes this machine's local paths.
+# Not committed.
+graphify-out/
+.claude/
+
+# Pycharm
+.idea/
