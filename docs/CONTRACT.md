@@ -310,6 +310,26 @@ def get_otp_setting(key: str, *, channel: str, purpose: str | None = None) -> An
 **The hash algorithm itself (HMAC-SHA256) is NOT configurable** — a deliberate non-setting, stated
 here explicitly so a later phase doesn't add a `HASH_ALGORITHM` key "for flexibility."
 
+**The `OTP` sub-dict's own shape (frozen at Phase 1, §11 item 16)** — not specified above, which
+only names the resolution chain and `DEFAULTS`' key list. Two flat sibling maps beside `DEFAULTS`
+implement that chain literally:
+
+```python
+"OTP": {
+    "DEFAULTS": {...},               # every key above, always fully populated
+    "CHANNELS": {                    # per-channel overrides, keyed by channel string
+        "email": {"LENGTH": 8, "TTL_SECONDS": 600},
+    },
+    "PURPOSES": {                    # per-purpose overrides, keyed by purpose string
+        "password_reset": {"TTL_SECONDS": 900},
+    },
+}
+```
+
+`get_otp_setting(key, *, channel, purpose)` checks `PURPOSES[purpose][key]`, then
+`CHANNELS[channel][key]`, then falls back to `DEFAULTS[key]` — exactly the order this section's
+first paragraph states. Both `CHANNELS` and `PURPOSES` default to `{}`.
+
 **Requires another app package: No.**
 
 ---
@@ -720,7 +740,7 @@ dependency, `APP-DESIGN.md` §1.1's named exception).
 ## §5. Endpoints
 
 Every view: a namespaced `throttle_scope` (literal string constants in `throttling.py` — see §11
-item 1 for why `appkit.throttling.throttle_scope()` cannot be used), a complete `@extend_schema`,
+item 16 for why `appkit.throttling.throttle_scope()` cannot be used), a complete `@extend_schema`,
 `tags=["jwt-multiauth"]` (self-service) or `["jwt-multiauth-admin"]` (admin). No serializer ever
 uses `fields = "__all__"`; no response ever exposes a password, a code, a `code_hash`, a
 `token_hash`, or `secret_encrypted`.
@@ -810,7 +830,18 @@ later phase implements `POLICY`, not `ENABLED`; there is no `ENABLED` key in thi
 | `REFRESH_COOKIE.NAME` | `"jwt_multiauth_refresh"` | Cookie name |
 | `REFRESH_COOKIE.SAMESITE` | `"Lax"` | `SameSite` attribute |
 | `REFRESH_COOKIE.SECURE` | `True` | `Secure` attribute — never `False` in this app's own default |
-| `OTP.DEFAULTS.*` | see §2 | Purpose/channel-resolved via `get_otp_setting` |
+| `OTP.DEFAULTS.LENGTH` | `6` | Code length. §12-frozen (§11 item 16) |
+| `OTP.DEFAULTS.ALPHABET` | `"numeric"` | The guide's own worked SMS-OTP baseline (§1); a host wanting 8-char alphanumeric email codes sets that under `OTP.CHANNELS.email`, not by changing this default |
+| `OTP.DEFAULTS.EXCLUDE_AMBIGUOUS` | `False` | No effect at `ALPHABET="numeric"`; relevant once a channel/purpose override switches to `"alpha"`/`"alphanumeric"` |
+| `OTP.DEFAULTS.CASE_SENSITIVE` | `False` | Same conditional relevance as above |
+| `OTP.DEFAULTS.TTL_SECONDS` | `300` | Challenge lifetime. §12-frozen safety rail (§11 item 16) |
+| `OTP.DEFAULTS.MAX_ATTEMPTS` | `5` | Verify attempts before the challenge locks out |
+| `OTP.DEFAULTS.RESEND_COOLDOWN_SECONDS` | `60` | Minimum gap between `resend()` calls |
+| `OTP.DEFAULTS.MAX_RESENDS` | `3` | Resend budget per challenge, snapshotted at creation |
+| `OTP.DEFAULTS.SINGLE_ACTIVE_CHALLENGE` | `True` | A new request for the same user+purpose+channel invalidates the prior unconsumed one |
+| `OTP.DEFAULTS.EMIT_LINK_TOKEN` | `False` | No magic-link token is minted unless a host opts in — fail-closed default |
+| `OTP.CHANNELS` | `{}` | Per-channel overrides, purpose/channel-resolved via `get_otp_setting` — see §2 |
+| `OTP.PURPOSES` | `{}` | Per-purpose overrides, resolved ahead of `OTP.CHANNELS` — see §2 |
 | `TWO_FACTOR.POLICY` | `"off"` | `"off"` \| `"opt_in"` \| `"required"` \| `"staff_only"`. `"off"` — no 2FA is ever offered or required, regardless of `ALLOWED_METHODS`/enrollment |
 | `TWO_FACTOR.ALLOWED_METHODS` | `["totp"]` | Subset of `totp`/`email_otp`/`phone_otp`/`recovery_code` |
 | `TWO_FACTOR.REQUIRE_DIFFERENT_CHANNEL` | `True` | Never loosened silently — a `False` override must be an explicit host choice, documented as weakening enumeration/replay resistance |
@@ -1163,7 +1194,45 @@ Everything not listed here is unchanged from
     `eligible_methods` never returns `["recovery_code"]` alone.
 15. **Guide typo noted, not corrected here:** `ALLOWED_METHODDS` at
     `docs/CLAUDE-CODE-GUIDE-APP-JWT-MULTIAUTH.md:59` (a local file to this repo, not a symlink into
-    `ecosystem-docs`) — fixable directly in a later phase without touching the shared docs.
+    `ecosystem-docs`) — fixed directly in Phase 1 (§0 item 2's restated text still repeats the
+    typo verbatim as a historical quote of the original guide prompt; the guide file itself is
+    corrected).
+16. **Phase 1 decisions, made because §0–§9 as written left them unresolved:**
+    - **The `OTP` sub-dict's own shape** — §2 named only the resolution chain and `DEFAULTS`' key
+      list, never the two override containers' names. `DEFAULTS`/`CHANNELS`/`PURPOSES`, two flat
+      sibling maps, chosen and now frozen — see §2's own updated text.
+    - **`OTP.DEFAULTS`' ten values** — §2/§6 as originally written named every key's *meaning* but
+      no key's *value*. Baseline chosen: 6-digit numeric, 300s TTL, 5 attempts, 60s resend
+      cooldown, 3 resends, `SINGLE_ACTIVE_CHALLENGE=True`, `EMIT_LINK_TOKEN=False` — the guide's
+      own worked SMS-OTP example (§1), not its email-channel override example. `TTL_SECONDS` is
+      now a §12-frozen safety rail; loosening it downward-implicitly-permissively is a MAJOR bump.
+    - **2FA field checks are gated on `TWO_FACTOR.POLICY`, not merely on `TWO_FACTOR.ALLOWED_METHODS`
+      membership.** §0 item 2 and §6's own encryption-key interaction already gate the `totp`
+      requirement on `POLICY != "off"`; `checks.py` applies the identical gate to
+      `USER_FIELDS.PHONE_FIELD`/`.EMAIL_FIELD` for `phone_otp`/`email_otp` when those methods sit
+      only in `TWO_FACTOR.ALLOWED_METHODS` (not also in `ALLOWED_AUTH_METHODS`) — a method a host
+      hasn't turned on via `POLICY` imposes no requirement, matching rule 2's own "never assumed"
+      standard and this guide's own review gate ("never a check that fires for a method the host
+      never enabled"). `ALLOWED_AUTH_METHODS` itself is never gated by `POLICY` — it governs
+      login, not second-factor enrollment. Without this gate, the *default* `TWO_FACTOR.
+      ALLOWED_METHODS = ["totp"]` would demand `JWT_MULTIAUTH_ENCRYPTION_KEY` on a zero-config
+      host, which this guide's own Phase 1 verify step explicitly forbids.
+    - **`checks.py`'s ID table**, none of which either document named:
+      `jwt_multiauth.E001` (an active method's `USER_FIELDS` entry unset), `.E002` (named field
+      doesn't exist), `.E003` (named field exists but isn't unique — expected to fire for
+      `email_otp` against stock `django.contrib.auth.User`, whose `email` isn't unique), `.E004`
+      (`totp` active, `JWT_MULTIAUTH_ENCRYPTION_KEY` unset), `.E005` (`totp` active, `totp` extra
+      not importable), `.E006` (a string outside `ALLOWED_AUTH_METHODS`'/`TWO_FACTOR.
+      ALLOWED_METHODS`' closed sets), `.W001` (an unrecognised top-level `JWT_MULTIAUTH` key,
+      mirroring `appkit.W003`).
+    - **`keys.py`'s HKDF parameters** — SHA-256, empty salt (RFC 5869 §2.2's zero-byte default),
+      32-byte output, `info` strings `b"jwt_multiauth/signing-key/v1"` /
+      `b"jwt_multiauth/otp-pepper/v1"`. Implemented on stdlib `hmac`/`hashlib`, not
+      `cryptography` — these two derived keys must work on a bare, extras-free install.
+    - **The throttling cross-reference at §5** pointed at the wrong item (originally "§11 item 1",
+      about `TWO_FACTOR.POLICY`) — corrected to point here. The actual reason
+      `appkit.throttling.throttle_scope()` is unusable is that it raises `ValueError` on any
+      argument containing an underscore, and `jwt_multiauth` has one.
 
 ---
 

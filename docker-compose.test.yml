@@ -1,0 +1,24 @@
+# Ephemeral Postgres for `make test`/`make test-bare` — a non-default host port so a test run
+# never collides with a developer's own local Postgres, or with another app package's own
+# `docker-compose.test.yml` (../appkit and ../base-scaffold use 55432, ../cleanup_app uses
+# 55433, ../django-dynamic-user uses 55434 — this repo deliberately uses 55435 so all four can
+# be brought up at once without a port-bind failure; matches this repo's own Makefile, which
+# already assumes port 55435 and database test_jwt_multiauth). Mirrors
+# ../django-dynamic-user/docker-compose.test.yml, which mirrors base-scaffold's own
+# docker-compose.test.yml (docs/APP-DESIGN.md §7.5): tmpfs data (RAM-backed, meaningfully
+# faster, nothing to clean up between runs) and a healthcheck so `docker compose up -d --wait`
+# actually blocks until Postgres is ready to accept connections.
+services:
+  test-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: test_jwt_multiauth
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports: ["55435:5432"]
+    tmpfs: /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10

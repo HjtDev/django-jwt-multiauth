@@ -1,0 +1,8 @@
+# Ships templates/, static/, and locale/ in the SDIST — not .py files, so no build backend
+# includes them by default (APP-DESIGN.md §2). Paired with include-package-data = true and
+# [tool.setuptools.package-data] in pyproject.toml, which is what actually lands them in the
+# WHEEL — this file alone is not enough, see that table's comment.
+recursive-include src/jwt_multiauth/templates *
+recursive-include src/jwt_multiauth/static *
+recursive-include src/jwt_multiauth/locale *.po *.mo
+include src/jwt_multiauth/py.typed

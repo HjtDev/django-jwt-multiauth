@@ -56,7 +56,7 @@ restated here with the reasoning behind each:
    `manage.py check` when `"phone_otp"` is in `ALLOWED_AUTH_METHODS` but the resolved user model
    has no field named `JWT_MULTIAUTH["USER_FIELDS"]["PHONE_FIELD"]`, or when `"email_otp"` is
    enabled and `["EMAIL_FIELD"]` doesn't resolve, or when `TWO_FACTOR["ENABLED"]` is true and
-   `"totp"` is in its `ALLOWED_METHODDS` but `JWT_MULTIAUTH_ENCRYPTION_KEY` is unset. A method a
+   `"totp"` is in its `ALLOWED_METHODS` but `JWT_MULTIAUTH_ENCRYPTION_KEY` is unset. A method a
    host never turns on imposes no requirement at all — this is a check on the *combination* of
    settings, not a blanket demand for every field this app could ever use.
 3. **Fail closed, everywhere, permanently.** An unresolvable second factor (the intersection of a
