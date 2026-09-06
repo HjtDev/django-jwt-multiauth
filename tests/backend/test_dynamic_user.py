@@ -58,6 +58,39 @@ def test_partial_user_fields_override_leaves_siblings_at_their_defaults() -> Non
 
 
 @pytest.mark.django_db
+def test_password_service_authenticate_works_against_the_swapped_user_model() -> None:
+    from jwt_multiauth.services import PasswordService
+
+    user = get_user_model().objects.create_user(username="phoneuser", password="a-strong-password")
+    assert PasswordService.authenticate("phoneuser", "a-strong-password") == user
+    assert PasswordService.authenticate("phoneuser", "wrong-password") is None
+    assert PasswordService.authenticate("nobody-at-all", "whatever") is None
+
+
+@pytest.mark.django_db
+def test_lockout_service_resolves_the_user_for_phone_otp_against_the_swapped_model() -> None:
+    from django.core.cache import cache
+
+    from jwt_multiauth.models import LoginAttempt
+    from jwt_multiauth.services import LockoutService
+
+    cache.clear()
+    user = get_user_model().objects.create_user(username="phoneuser", phone="+15551234567")
+
+    LockoutService.record_attempt(
+        "+15551234567",
+        ip="203.0.113.1",
+        success=False,
+        method="phone_otp",
+        reason="wrong_credential",
+    )
+
+    row = LoginAttempt.objects.get(identifier="+15551234567")
+    assert row.user_id == user.pk
+    assert row.method == "phone_otp"
+
+
+@pytest.mark.django_db
 def test_every_model_round_trips_a_row_against_the_swapped_user_model() -> None:
     from jwt_multiauth.factories import (
         AuthSessionFactory,

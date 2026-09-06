@@ -659,19 +659,25 @@ class UserProvisioningService:
 class PasswordService:
     @staticmethod
     def authenticate(identifier: str, password: str) -> Any | None:
-        """Resolves identifier against USER_FIELDS.IDENTIFIER_FIELDS in order. On ANY failure to
-        resolve OR a resolved-but-wrong password, performs
-        django.contrib.auth.hashers.check_password against a fixed dummy hash before returning
-        None — this is what makes the unknown-identifier and wrong-password paths take the same
-        time. Never raises; returns None on any failure."""
+        """Resolves identifier against USER_FIELDS.IDENTIFIER_FIELDS in order. Exactly ONE
+        password-hash comparison happens on any failure path (§11 item 20 corrects this
+        docstring's earlier "on ANY failure ... performs a dummy check" wording, which read as
+        two comparisons stacked on a resolved-but-wrong-password failure): a real
+        user.check_password() call when identifier resolves to a wrong password, a dummy
+        django.contrib.auth.hashers.check_password() against a fixed hash when it resolves to no
+        one at all — mirrors django.contrib.auth.backends.ModelBackend's own DoesNotExist branch.
+        This is what makes the unknown-identifier and wrong-password paths cost the same instead
+        of the former looking suspiciously cheap. Never raises; returns None on any failure."""
         ...
 
     @staticmethod
     def change_password(user: Any, old_password: str, new_password: str) -> None:
         """Raises on a wrong old_password or a new_password failing AUTH_PASSWORD_VALIDATORS. On
-        success: fires password_changed, then UNCONDITIONALLY calls
-        TokenService.revoke_all_sessions(user, reason="password_changed") — no settings flag
-        disables this."""
+        success: UNCONDITIONALLY calls TokenService.revoke_all_sessions(user,
+        reason="password_changed") — no settings flag disables this — and only THEN fires
+        password_changed (§11 item 20 corrects this docstring's earlier "fires password_changed,
+        then... revokes" ordering to match §3's own "AFTER every other session has been revoked":
+        a receiver observing the signal can rely on every session already being dead)."""
         ...
 
     @staticmethod
@@ -780,11 +786,22 @@ class VerificationService:
 
 class LockoutService:
     @staticmethod
-    def record_attempt(identifier: str, *, ip: str, success: bool, reason: str | None = None) -> None:
-        """Always writes a LoginAttempt row, success or not. On failure: increments an
-        appkit.cache-backed counter keyed by LOCKOUT.LOCK_SCOPE within LOCKOUT.WINDOW_SECONDS, and
-        fires account_locked the moment MAX_ATTEMPTS is reached for the active scope. Fires
-        login_failed on every failure regardless of lock state."""
+    def record_attempt(
+        identifier: str,
+        *,
+        ip: str,
+        success: bool,
+        method: str = "password",
+        reason: str | None = None,
+        user_agent: str = "",
+    ) -> None:
+        """Always writes a LoginAttempt row, success or not. method/user_agent added (§11 item
+        21) — LoginAttempt.method is a non-null CharField with a closed choice set and the
+        originally-drafted signature had no value to write it from; every call site this
+        contract itself documents still works verbatim under the "password" default. On failure:
+        increments an appkit.cache-backed counter keyed by LOCKOUT.LOCK_SCOPE within
+        LOCKOUT.WINDOW_SECONDS, and fires account_locked the moment MAX_ATTEMPTS is reached for
+        the active scope. Fires login_failed on every failure regardless of lock state."""
         ...
 
     @staticmethod
@@ -1424,6 +1441,37 @@ Everything not listed here is unchanged from
       FK filled in at verify time, linking the audit trail to the account it produced; a new
       `user_provisioned` signal (§3); `created: true` surfaced in the verify/login response so a
       frontend can route to onboarding instead of the dashboard.
+20. **`password_changed` fires AFTER `revoke_all_sessions`, not before — confirmed with the
+    user, Phase 5.** §3's own signal doc already said "after... every other session has been
+    revoked"; an earlier draft of §4's `change_password`/`confirm_reset` docstrings read "fires
+    password_changed, then... revokes," which this item resolves in §3's favor (both docstrings
+    corrected above) — a receiver observing the signal can rely on every session already being
+    dead, the stronger guarantee. `change_password`/`confirm_reset` share one private tail
+    (`_finish_password_reset_or_change`) so the two can never drift on this ordering.
+21. **`LockoutService.record_attempt` gains `method: str = "password"` and `user_agent: str = ""`
+    (keyword-only, defaulted) — confirmed with the user, Phase 5.** `LoginAttempt.method` is a
+    non-null `CharField` with a closed choice set (`password`/`email_otp`/`phone_otp`) and the
+    originally-drafted §4 signature had no value to write it from. Every call site this contract
+    itself documents (all `"password"`-method logins) still works verbatim under the default;
+    Phase 6's OTP-login views pass `method="email_otp"`/`"phone_otp"` explicitly so the admin's
+    own `method` filter (Phase 2) is meaningful rather than a permanent lie.
+22. **`tasks.py`'s three non-`LOGIN_ATTEMPT_RETENTION_DAYS` purge windows are module constants in
+    `tasks.py`, not new settings keys — confirmed with the user, Phase 5.** §8 requires purging
+    `OtpChallenge`/`AuthSession`/`TrustedDevice` rows "well past" their own `expires_at` without
+    ever defining how far past, and §6 has no key for it. `_OTP_GRACE = timedelta(days=1)`,
+    `_SESSION_GRACE = _TRUSTED_DEVICE_GRACE = timedelta(days=7)` — a deliberate non-setting, the
+    same precedent as `otp._AMBIGUOUS` and the non-configurable hash algorithm (§2). A host
+    wanting a different window runs its own equivalent query against these already-public models
+    rather than this app growing a permanently-frozen key for a value almost no host will ever
+    touch.
+23. **`VerificationService.confirm(user, challenge_id, *, code)` — the `user`-first form ships,
+    confirmed with the user, Phase 5.** The guide's own Phase 5 prompt drafted
+    `confirm(challenge_id, *, code)`, omitting `user` entirely; §4's own signature (this file,
+    above) already carried `user` first. The extra argument is what lets `confirm` prove the
+    verified challenge's resolved user actually matches the authenticated caller before writing a
+    `VerifiedContact` row — a real IDOR guard the `(challenge_id,)`-only form could not make; a
+    mismatch is rejected with the same `ChallengeInvalid` every other rejection uses, never a
+    distinguishable error.
 
 ---
 

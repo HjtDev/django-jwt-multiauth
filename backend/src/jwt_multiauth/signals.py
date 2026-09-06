@@ -3,11 +3,15 @@
 ``user_logged_out``, ``login_failed``, ``account_locked``, ``password_changed``,
 ``two_factor_enabled``, ``two_factor_disabled``, ``refresh_reuse_detected``, ``session_revoked``.
 
-Populated incrementally as the services that emit each signal land: Phase 3 (token/session
-signals — ``user_logged_in``, ``refresh_reuse_detected``, ``session_revoked``), Phase 4 (OTP and
-auto-provisioning signals — ``phone_otp_requested``, ``email_otp_requested``, ``otp_verified``,
-``user_provisioned``), and completed in Phase 5 (the remaining login/lockout/password/2FA
-signals), per ``docs/CONTRACT.md`` §3.
+The full set, per ``docs/CONTRACT.md`` §3. Shipped incrementally as the services that emit each
+signal landed: Phase 3 (token/session signals — ``user_logged_in``, ``refresh_reuse_detected``,
+``session_revoked``), Phase 4 (OTP and auto-provisioning signals — ``phone_otp_requested``,
+``email_otp_requested``, ``otp_verified``, ``user_provisioned``), Phase 5 (``contact_verified``,
+``login_failed``, ``account_locked``, ``password_changed`` — the emitting services now exist;
+``user_logged_out``, ``two_factor_enabled``, ``two_factor_disabled`` are declared here too, per
+the guide's "every signal from CONTRACT.md item 3" instruction, but are emitted starting Phase 6
+(``user_logged_out``, the logout view) and Phase 7 (``two_factor_enabled``/``two_factor_disabled``,
+``TwoFactorService``) respectively.
 
 Every payload is primitives/IDs only — never a model instance, checked explicitly at review time
 per phase. ``account_locked``'s payload is ``user_id: int | None, identifier: str, until:
@@ -68,3 +72,38 @@ user_provisioned = django.dispatch.Signal()
 """Sent by UserProvisioningService.get_or_create() the moment it creates a NEW user — never for
 an existing one. sender=get_user_model().
 Payload: user_id: int, field: str, value: str"""
+
+contact_verified = django.dispatch.Signal()
+"""Sent by VerificationService.confirm() after the matching VerifiedContact row is created.
+sender=VerifiedContact.
+Payload: user_id: int, field: str, value: str"""
+
+user_logged_out = django.dispatch.Signal()
+"""Sent by the logout view after TokenService.revoke_session() succeeds for the CALLER's own
+current session. sender=AuthSession.
+Payload: user_id: int, session_id: str"""
+
+login_failed = django.dispatch.Signal()
+"""Sent by LockoutService.record_attempt() whenever success=False, including on the no-such-
+identifier path. sender=LoginAttempt.
+Payload: identifier: str, reason: str, ip: str"""
+
+account_locked = django.dispatch.Signal()
+"""Sent by LockoutService.record_attempt() the moment MAX_ATTEMPTS is reached within WINDOW_SECONDS
+for the active LOCK_SCOPE. sender=LoginAttempt.
+Payload: user_id: int | None, identifier: str, until: datetime, scope: str"""
+
+password_changed = django.dispatch.Signal()
+"""Sent by PasswordService.change_password() and .confirm_reset(), after the new password is set
+and AFTER every other session has been revoked. sender=get_user_model().
+Payload: user_id: int"""
+
+two_factor_enabled = django.dispatch.Signal()
+"""Sent by TwoFactorService.confirm_totp() (the only enrollment path that requires confirmation;
+email_otp/phone_otp/recovery_code have no separate "enabled" step). sender=TwoFactorDevice.
+Payload: user_id: int, method: str"""
+
+two_factor_disabled = django.dispatch.Signal()
+"""Sent by TwoFactorService.disable() AND .admin_force_disable() — both paths, same signal, so a
+host's receiver doesn't need to special-case which caller disabled it. sender=TwoFactorDevice.
+Payload: user_id: int, method: str"""
