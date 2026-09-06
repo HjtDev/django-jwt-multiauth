@@ -20,23 +20,33 @@ semver-trigger list).
 
 from __future__ import annotations
 
+import hashlib
 import hmac
+import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, TypedDict, cast
+from typing import Any, Final, TypedDict, cast
 
+from appkit.cache import build_cache_key, invalidate_namespace
 from django.contrib.auth import get_user_model
+from django.contrib.auth.hashers import check_password, make_password
+from django.contrib.auth.password_validation import validate_password
+from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.db import transaction
 from django.utils import timezone
 from django.utils.module_loading import import_string
 
 from jwt_multiauth import conf, keys, otp, tokens
-from jwt_multiauth.models import AuthSession, OtpChallenge, VerifiedContact
+from jwt_multiauth.models import AuthSession, LoginAttempt, OtpChallenge, VerifiedContact
 from jwt_multiauth.signals import (
+    account_locked,
+    contact_verified,
     email_otp_requested,
+    login_failed,
     otp_verified,
+    password_changed,
     phone_otp_requested,
     refresh_reuse_detected,
     session_revoked,
@@ -129,6 +139,12 @@ class OtpVerifyResult:
     # 19) — the shared login-response helper (Phase 6) reads this to apply the 2FA-bootstrap
     # carve-out and to set the response's own created field. False on every non-auto-provisioning
     # path.
+
+
+@dataclass(frozen=True)
+class LockStatus:
+    locked: bool
+    until: datetime | None
 
 
 class TokenService:
@@ -339,6 +355,31 @@ def _resolve_user_for_channel(identifier: str, *, channel: str) -> Any | None:
     if not field_name:
         return None
     return get_user_model().objects.filter(**{field_name: identifier}).first()
+
+
+def _resolve_user_by_identifier_fields(identifier: str) -> Any | None:
+    """Resolve ``identifier`` against ``USER_FIELDS.IDENTIFIER_FIELDS`` in order — the password
+    login resolution order (docs/CONTRACT.md §4/§11 item 5), the first field with a match wins.
+    Used by ``PasswordService.authenticate``/``.request_reset`` and by
+    ``LockoutService.record_attempt`` for ``method="password"`` attempts.
+    """
+    model = get_user_model()
+    for field_name in conf.get_setting("USER_FIELDS")["IDENTIFIER_FIELDS"]:
+        user = model.objects.filter(**{field_name: identifier}).first()
+        if user is not None:
+            return user
+    return None
+
+
+def _resolve_user_for_login_attempt(identifier: str, *, method: str) -> Any | None:
+    """Resolve ``identifier`` -> user for ``LockoutService.record_attempt``'s ``LoginAttempt.user``
+    FK, using the resolution rule that matches how ``method`` actually authenticates: the
+    password-login order for ``"password"``, the single OTP-channel field otherwise.
+    """
+    if method == "password":
+        return _resolve_user_by_identifier_fields(identifier)
+    channel = "phone" if method == "phone_otp" else "email"
+    return _resolve_user_for_channel(identifier, channel=channel)
 
 
 class UserProvisioningService:
@@ -704,4 +745,371 @@ class OtpService:
             challenge_id=str(challenge.challenge_id),
             expires_at=challenge.expires_at,
             resend_available_at=timezone.now() + timedelta(seconds=cooldown),
+        )
+
+
+#: A real hash under whatever hasher the host has configured (PASSWORD_HASHERS[0]) — computed
+#: once at import time from a random, unusable value, never a hardcoded literal. A literal would
+#: run under a fixed, possibly-wrong algorithm/cost and defeat the entire point of comparing
+#: apples to apples against a real user's own check_password() call.
+_DUMMY_PASSWORD_HASH: Final[str] = make_password(secrets.token_urlsafe(32))
+
+
+def _finish_password_reset_or_change(user: Any, new_password: str) -> None:
+    """Shared tail of ``PasswordService.change_password``/``.confirm_reset`` — validates the new
+    password against ``AUTH_PASSWORD_VALIDATORS``, sets it, then UNCONDITIONALLY revokes every
+    session for ``user`` (no ``except_session_id`` — docs/CONTRACT.md §4/§10 both call
+    ``revoke_all_sessions`` with no exception; the caller's own session dies too, and the view
+    layer, Phase 6, is what re-issues a fresh pair for them), and only THEN fires
+    ``password_changed`` — after revocation actually commits, per docs/CONTRACT.md §3 (§11 item
+    20 resolves a wording mismatch against an earlier draft of §4's own docstring, which read
+    "fires password_changed, then... revokes", in §3's favor: a receiver observing the signal can
+    rely on every session already being dead).
+    """
+    validate_password(new_password, user=user)
+    user.set_password(new_password)
+    user.save(update_fields=["password"])
+    TokenService.revoke_all_sessions(user, reason="password_changed")
+    password_changed.send(sender=get_user_model(), user_id=user.pk)
+
+
+class PasswordService:
+    """Password authentication, change, and OTP-mediated reset — docs/CONTRACT.md §4, Phase 5.
+    Built on ``OtpService`` (reset is just a ``purpose="password_reset"`` OTP challenge) and
+    ``TokenService.revoke_all_sessions`` (a change/reset always kills every session, §10).
+    """
+
+    @staticmethod
+    def authenticate(identifier: str, password: str) -> Any | None:
+        """Resolves ``identifier`` against ``USER_FIELDS.IDENTIFIER_FIELDS`` in order. Exactly one
+        password-hash comparison happens on any failure path — a real ``user.check_password()``
+        call when ``identifier`` resolves to a wrong password, a dummy ``check_password()``
+        against a FIXED, pre-computed hash when it resolves to no one at all — so the
+        no-such-identifier and wrong-password paths cost the same instead of the former looking
+        suspiciously cheap. Mirrors ``django.contrib.auth.backends.ModelBackend``'s own
+        ``DoesNotExist`` branch, which solves the identical problem via
+        ``UserModel().set_password(password)`` rather than an extra hash comparison stacked on
+        top of the real one. Never raises; returns ``None`` on any failure.
+        """
+        user = _resolve_user_by_identifier_fields(identifier)
+        if user is None:
+            check_password(password, _DUMMY_PASSWORD_HASH)
+            return None
+        if not user.check_password(password):
+            return None
+        return user
+
+    @staticmethod
+    def change_password(user: Any, old_password: str, new_password: str) -> None:
+        """Raises ``django.core.exceptions.ValidationError`` — ``code="invalid_old_password"`` for
+        a wrong ``old_password`` (checked unconditionally;
+        ``PASSWORD.REQUIRE_OLD_PASSWORD_ON_CHANGE`` is a documented rail, not a toggle,
+        docs/CONTRACT.md §6), or Django's own ``AUTH_PASSWORD_VALIDATORS`` messages for a
+        ``new_password`` that fails validation. On success: see
+        ``_finish_password_reset_or_change``.
+        """
+        if not user.check_password(old_password):
+            raise ValidationError("The old password is incorrect.", code="invalid_old_password")
+        _finish_password_reset_or_change(user, new_password)
+
+    @staticmethod
+    def request_reset(identifier: str) -> None:
+        """Always returns, never raises, for ANY identifier — including one that doesn't resolve
+        at all. Resolves ``identifier`` against ``IDENTIFIER_FIELDS``; if it resolves, picks the
+        first channel in ``PASSWORD.RESET_CHANNEL_PREFERENCE`` for which the user actually has a
+        non-empty value, and delegates to ``OtpService.request`` with THAT value as the
+        destination. If it doesn't resolve (or resolves to a user with no usable contact value on
+        any preferred channel), delegates with the raw ``identifier`` on the first *configured*
+        preference channel instead — landing on ``OtpService.request``'s own enumeration-resistant
+        decoy/auto-provision fork, never a branch distinguishable from here. The result is
+        discarded entirely; the view layer (Phase 6) is what turns this into an unconditional 200.
+
+        Raises ``ImproperlyConfigured`` only for a configuration gap independent of
+        ``identifier`` — neither ``USER_FIELDS.EMAIL_FIELD`` nor ``.PHONE_FIELD`` set for any
+        entry in ``RESET_CHANNEL_PREFERENCE`` at all — since that reveals nothing about any
+        specific identifier and is rule 3's fail-closed rule applied to configuration, not
+        credentials.
+        """
+        user_fields = conf.get_setting("USER_FIELDS")
+        preference = conf.get_setting("PASSWORD")["RESET_CHANNEL_PREFERENCE"]
+
+        def field_for(channel: str) -> str | None:
+            key = "EMAIL_FIELD" if channel == "email" else "PHONE_FIELD"
+            return cast("str | None", user_fields[key])
+
+        configured = [channel for channel in preference if field_for(channel)]
+        if not configured:
+            raise ImproperlyConfigured(
+                "jwt_multiauth: PasswordService.request_reset() has no usable delivery channel — "
+                "neither USER_FIELDS['EMAIL_FIELD'] nor USER_FIELDS['PHONE_FIELD'] is set for any "
+                "entry in PASSWORD['RESET_CHANNEL_PREFERENCE']."
+            )
+
+        user = _resolve_user_by_identifier_fields(identifier)
+        channel = configured[0]
+        destination = identifier
+        if user is not None:
+            for candidate in configured:
+                value = getattr(user, cast("str", field_for(candidate)), "") or ""
+                if value:
+                    channel, destination = candidate, value
+                    break
+
+        OtpService.request(destination, channel=channel, purpose="password_reset")
+
+    @staticmethod
+    def confirm_reset(
+        challenge_id: str,
+        *,
+        code: str | None = None,
+        link_token: str | None = None,
+        new_password: str,
+    ) -> None:
+        """Raises ``ChallengeInvalid`` (via ``OtpService.verify``) for a challenge that doesn't
+        resolve/expired/consumed/exhausted, whose ``purpose`` isn't ``"password_reset"``, or whose
+        verify just auto-provisioned a brand-new user (``result.created``). ``OtpService.verify``
+        itself provisions unconditionally whenever a ``user=None`` row's code checks out,
+        regardless of ``purpose`` — this method cannot and does not prevent that row from existing
+        afterward. What it refuses is to ALSO set a password for that just-minted, still-unproven
+        identity: acting on it here would make password reset a second, undocumented way to turn
+        an unresolved identifier into a real account, when auto-provisioning is documented as an
+        OTP *login* side effect only (docs/CONTRACT.md's own scope boundary). On success: see
+        ``_finish_password_reset_or_change``.
+        """
+        result = OtpService.verify(challenge_id, code=code, link_token=link_token)
+        if result.purpose != "password_reset" or result.created:
+            raise ChallengeInvalid("OTP challenge is not a valid password_reset challenge.")
+        _finish_password_reset_or_change(result.user, new_password)
+
+
+_VALID_LOGIN_METHODS: Final[frozenset[str]] = frozenset({"password", "email_otp", "phone_otp"})
+_VALID_FAILURE_REASONS: Final[frozenset[str]] = frozenset(
+    {"no_such_identifier", "wrong_credential", "locked", "two_factor_unavailable"}
+)
+_VALID_LOCK_SCOPES: Final[frozenset[str]] = frozenset({"identifier", "ip", "identifier_and_ip"})
+
+#: Global namespace for LOCK_SCOPE="ip" — a lock/counter under this scope has no per-identifier
+#: component at all, which is exactly why LockoutService.unlock(identifier) can never reach it
+#: (see its own docstring).
+_LOCKOUT_IP_NAMESPACE: Final[str] = "jwt_multiauth.lockout.ip"
+
+
+def _lockout_identifier_namespace(identifier: str) -> str:
+    """A per-identifier cache namespace, keyed by a hash rather than the raw identifier — mirrors
+    ``appkit.cache.build_cache_key``'s own reasoning for hashing long/unsafe parts, except here
+    the identifier itself (an email, a phone number, PII) must never appear verbatim in a cache
+    backend's key listing.
+    """
+    digest = hashlib.sha256(identifier.encode()).hexdigest()[:32]
+    return f"jwt_multiauth.lockout.id.{digest}"
+
+
+def _lockout_keys(identifier: str, *, ip: str) -> tuple[str, str]:
+    """Resolve the ``(attempts_key, lock_key)`` pair for the currently-configured
+    ``LOCKOUT.LOCK_SCOPE``. Raises ``ImproperlyConfigured`` for an unrecognized scope — fail
+    closed, never silently default to one of the three (docs/CONTRACT.md §10's own trade-off
+    discussion assumes all three are actually implemented, not two-plus-a-fallback).
+    """
+    scope = conf.get_setting("LOCKOUT")["LOCK_SCOPE"]
+    if scope not in _VALID_LOCK_SCOPES:
+        raise ImproperlyConfigured(
+            f"JWT_MULTIAUTH['LOCKOUT']['LOCK_SCOPE'] = {scope!r} is invalid — must be one of "
+            f"{sorted(_VALID_LOCK_SCOPES)}."
+        )
+    parts: tuple[str, ...]
+    if scope == "identifier":
+        namespace, parts = _lockout_identifier_namespace(identifier), ()
+    elif scope == "identifier_and_ip":
+        namespace, parts = _lockout_identifier_namespace(identifier), (ip,)
+    else:  # "ip"
+        namespace, parts = _LOCKOUT_IP_NAMESPACE, (ip,)
+    return (
+        build_cache_key(namespace, "attempts", *parts),
+        build_cache_key(namespace, "lock", *parts),
+    )
+
+
+class LockoutService:
+    """Login-attempt auditing and cache-backed lockout — docs/CONTRACT.md §4, Phase 5. Writes a
+    ``LoginAttempt`` row on every call, success or not; failures additionally drive a
+    ``LOCKOUT.LOCK_SCOPE``-keyed counter via ``django.core.cache`` (``appkit.cache`` builds the
+    versioned keys, but exposes no atomic increment of its own, so the counter itself is a direct
+    ``cache.add``/``cache.incr`` pair — Django's own cache API contract for a race-safe counter).
+    """
+
+    @staticmethod
+    def record_attempt(
+        identifier: str,
+        *,
+        ip: str,
+        success: bool,
+        method: str = "password",
+        reason: str | None = None,
+        user_agent: str = "",
+    ) -> None:
+        """Always writes a ``LoginAttempt`` row. ``method`` — defaulted to ``"password"`` rather
+        than added as a new required positional, docs/CONTRACT.md §11 item 21, since
+        ``LoginAttempt.method`` has no value to write from the frozen §4 signature otherwise — must
+        be one of ``LoginAttempt.method``'s choices. ``reason`` is REQUIRED (one of
+        ``LoginAttempt.failure_reason``'s choices) when ``success=False``; ignored (forced to
+        ``None``) when ``success=True``.
+
+        On failure: fires ``login_failed`` unconditionally, then increments the active
+        ``LOCK_SCOPE``'s counter within ``LOCKOUT.WINDOW_SECONDS``, firing ``account_locked``
+        exactly once — via ``cache.add`` on the lock key itself, not a separate "first time"
+        flag — the instant the count reaches ``LOCKOUT.MAX_ATTEMPTS``.
+        """
+        if method not in _VALID_LOGIN_METHODS:
+            raise ValueError(f"Unknown LoginAttempt.method {method!r}.")
+        if success:
+            reason = None
+        elif reason not in _VALID_FAILURE_REASONS:
+            raise ValueError(
+                f"LockoutService.record_attempt(success=False) requires reason to be one of "
+                f"{sorted(_VALID_FAILURE_REASONS)}, got {reason!r}."
+            )
+
+        user = _resolve_user_for_login_attempt(identifier, method=method)
+        LoginAttempt.objects.create(
+            user=user,
+            identifier=identifier,
+            method=method,
+            ip_address=ip,
+            user_agent=user_agent[:512],
+            success=success,
+            failure_reason=reason,
+        )
+
+        if success:
+            return
+
+        login_failed.send(sender=LoginAttempt, identifier=identifier, reason=reason, ip=ip)
+
+        lockout = conf.get_setting("LOCKOUT")
+        attempts_key, lock_key = _lockout_keys(identifier, ip=ip)
+        cache.add(attempts_key, 0, timeout=lockout["WINDOW_SECONDS"])
+        try:
+            count = cache.incr(attempts_key)
+        except ValueError:
+            # The key expired between the `add` above and this `incr` (a WINDOW_SECONDS race,
+            # not a bug) — reseed at 1 rather than letting incr raise past this method's own
+            # never-raises-on-a-failed-attempt contract.
+            cache.set(attempts_key, 1, timeout=lockout["WINDOW_SECONDS"])
+            count = 1
+
+        if count >= lockout["MAX_ATTEMPTS"]:
+            until = timezone.now() + timedelta(seconds=lockout["LOCK_DURATION_SECONDS"])
+            # `add`, not `set`: only the call that actually WINS the race to create the lock key
+            # fires account_locked — every subsequent failing attempt against an already-locked
+            # identifier/ip sees `add` return False and stays silent.
+            if cache.add(lock_key, until.isoformat(), timeout=lockout["LOCK_DURATION_SECONDS"]):
+                account_locked.send(
+                    sender=LoginAttempt,
+                    user_id=user.pk if user is not None else None,
+                    identifier=identifier,
+                    until=until,
+                    scope=lockout["LOCK_SCOPE"],
+                )
+
+    @staticmethod
+    def is_locked(identifier: str, *, ip: str) -> LockStatus:
+        """Checked BEFORE ``PasswordService.authenticate``/``OtpService.verify`` are ever called
+        at every real call site (Phase 6), so a locked-out caller never even reaches the
+        dummy-hash path. This does not reintroduce a timing side-channel: locked-vs-not-locked is
+        not a secret about a SPECIFIC identifier's validity the way "which password is right" is
+        — it is a rate-limit state, not a credential, so a fast-path cache read here leaks
+        nothing rule 5 protects. One cache read; never raises beyond the same
+        ``ImproperlyConfigured`` an unrecognized ``LOCK_SCOPE`` already raises from
+        ``_lockout_keys``.
+        """
+        _, lock_key = _lockout_keys(identifier, ip=ip)
+        until_raw = cache.get(lock_key)
+        if until_raw is None:
+            return LockStatus(locked=False, until=None)
+        until = datetime.fromisoformat(until_raw)
+        if until <= timezone.now():
+            return LockStatus(locked=False, until=None)
+        return LockStatus(locked=True, until=until)
+
+    @staticmethod
+    def unlock(identifier: str) -> None:
+        """Admin-only caller (Phase 8). Bumps the per-identifier cache namespace's version,
+        which resets BOTH the attempt counter and any active lock for ``identifier`` in one call
+        — idempotent, and effective across every IP that namespace's keys were ever built with
+        (covers ``"identifier"`` and ``"identifier_and_ip"`` scopes). Under
+        ``LOCKOUT.LOCK_SCOPE="ip"`` a lock has no per-identifier component to invalidate at all
+        (see ``_lockout_keys``) — this call is then a harmless no-op for that configuration; an
+        IP-scoped lock must be lifted at the infrastructure layer instead.
+        """
+        invalidate_namespace(_lockout_identifier_namespace(identifier))
+
+
+class VerificationService:
+    """Contact-field (email/phone) verification for an ALREADY-authenticated user —
+    docs/CONTRACT.md §4, Phase 5. Distinct from OTP *login*: the caller's identity is never in
+    question here, so no decoy path applies at all (docs/CONTRACT.md §4).
+    """
+
+    @staticmethod
+    def request_contact_verification(user: Any, *, field: str) -> OtpRequestResult:
+        """Delegates to ``OtpService.request`` with ``purpose="verify_contact"``, destination =
+        the user's CURRENT value for ``field``. Raises ``ValueError`` for a ``field`` other than
+        ``"email"``/``"phone"``, ``ImproperlyConfigured`` if the matching ``USER_FIELDS`` entry
+        isn't configured at all, and ``django.core.exceptions.ValidationError`` if the user's own
+        value for that field is currently empty — nothing to verify. No decoy path applies: the
+        caller is already authenticated, so the identifier always resolves (to themselves).
+        """
+        if field not in ("email", "phone"):
+            raise ValueError(
+                f"VerificationService field must be 'email' or 'phone', got {field!r}."
+            )
+
+        user_fields = conf.get_setting("USER_FIELDS")
+        field_key = "EMAIL_FIELD" if field == "email" else "PHONE_FIELD"
+        field_name = user_fields[field_key]
+        if not field_name:
+            raise ImproperlyConfigured(
+                f"USER_FIELDS[{field_key!r}] is not configured; "
+                f"VerificationService.request_contact_verification() has no field to verify."
+            )
+
+        value = getattr(user, field_name, "") or ""
+        if not value:
+            raise ValidationError(
+                f"The user has no value set for the {field!r} field to verify.",
+                code="no_contact_value",
+            )
+        return OtpService.request(value, channel=field, purpose="verify_contact")
+
+    @staticmethod
+    def confirm(user: Any, challenge_id: str, *, code: str) -> None:
+        """Raises ``ChallengeInvalid`` (via ``OtpService.verify``) for a challenge that doesn't
+        resolve/expired/consumed/exhausted, whose ``purpose`` isn't ``"verify_contact"``, whose
+        verify just auto-provisioned a brand-new user (``result.created`` — same reasoning as
+        ``PasswordService.confirm_reset``: ``OtpService.verify`` provisions unconditionally
+        whenever a ``user=None`` row's code checks out regardless of ``purpose``, so this method
+        cannot prevent that row from existing; it only refuses to ALSO record a ``VerifiedContact``
+        for that just-minted, still-unproven identity), or whose verified user doesn't match the
+        caller — an
+        IDOR guard only possible because this method takes ``user`` in the first place
+        (docs/CONTRACT.md §4's frozen signature, distinguishing it from the guide prompt's own
+        ``(challenge_id, *, code)`` draft, docs/CONTRACT.md §11 item 23). On success:
+        ``get_or_create``s a ``VerifiedContact`` row for (user, field, destination) — read off the
+        challenge row, never off the request — and fires ``contact_verified``.
+        """
+        result = OtpService.verify(challenge_id, code=code)
+        if result.purpose != "verify_contact" or result.created or result.user.pk != user.pk:
+            raise ChallengeInvalid(
+                "OTP challenge is not a valid verify_contact challenge for this user."
+            )
+
+        challenge = OtpChallenge.objects.get(pk=challenge_id)
+        VerifiedContact.objects.get_or_create(
+            user=user, field=challenge.channel, value=challenge.destination
+        )
+        contact_verified.send(
+            sender=VerifiedContact,
+            user_id=user.pk,
+            field=challenge.channel,
+            value=challenge.destination,
         )
