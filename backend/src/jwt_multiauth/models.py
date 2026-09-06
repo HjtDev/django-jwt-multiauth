@@ -7,10 +7,14 @@ Phase 2 implements all seven exactly as ``docs/CONTRACT.md`` §1 specifies, with
 
 Every FK/O2O-shaped reference anywhere in this module is ``settings.AUTH_USER_MODEL`` — never a
 concrete user-model import (this repo's ``CLAUDE.md`` rule 1). ``OtpChallenge.user`` is nullable
-in the schema but never actually written as ``None`` in v1.0.0 (``docs/CONTRACT.md`` §11 item 11)
-— the field allows it structurally so a future purpose needing an unresolved-user row isn't
-blocked at the schema level, but no code path in this app writes a decoy row; the decoy-challenge
-behavior (rule 5, enumeration resistance) is implemented without ever persisting one.
+in the schema, and Phase 4 is the first code path that ever writes it as ``None``: for a method
+NOT in ``USER_FIELDS.AUTO_PROVISION_METHODS``, an unresolved identifier is still a decoy — nothing
+is ever persisted, exactly as before. For a method IN that list, an unresolved identifier now
+persists a REAL row with ``user=None`` instead (``docs/CONTRACT.md`` §11 item 19) — the account
+doesn't exist yet, but the challenge is genuine and may create one at verify time
+(``services.UserProvisioningService``). Either way, ``user=None`` never means "decoy"; it means
+"not yet resolved to an account", and ``OtpService.verify()`` treats a decoy and a real-but-expired
+challenge identically (§10) regardless of which reason produced the null.
 
 Every secret-holding field (an OTP code, a recovery code, a TOTP seed, a refresh/session token)
 is a plain ``CharField``/``TextField`` here — hashing (``otp.hash_secret``, HMAC-SHA256 via
@@ -45,10 +49,14 @@ from django.db import models
 
 
 class OtpChallenge(models.Model):  # noqa: DJ008 -- see module docstring
-    """A single OTP/magic-link challenge. Real challenges (identifier resolved) are persisted;
-    decoy challenges (identifier did not resolve) are NEVER persisted — see §5's enumeration-
-    resistance note and §11 item 11. user is nullable in the schema for that reason alone: a real
-    row always has a user, and no code path in this app ever creates a row with user=None.
+    """A single OTP/magic-link challenge. For a method NOT in
+    ``USER_FIELDS.AUTO_PROVISION_METHODS``, an unresolved identifier is a decoy — nothing is ever
+    persisted, see §5's enumeration-resistance note. For a method IN that list, an unresolved
+    identifier persists a REAL row with user=None — the account doesn't exist yet, but the
+    challenge is genuine and may create one at verify time (services.UserProvisioningService,
+    docs/CONTRACT.md §11 item 19). Either way user=None never means "decoy"; it means "not yet
+    resolved to an account", and OtpService.verify() treats a decoy and a real-but-expired
+    challenge identically (§10) regardless of which reason produced the null.
     """
 
     challenge_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

@@ -36,4 +36,5 @@ class JwtMultiauthConfig(AppConfig):
         register(checks.check_user_field_requirements)
         register(checks.check_totp_requirements)
         register(checks.check_allowed_methods_closed_set)
+        register(checks.check_auto_provisioning_requirements)
         register(checks.check_unknown_settings_keys)

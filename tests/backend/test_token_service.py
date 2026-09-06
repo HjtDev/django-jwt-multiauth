@@ -7,13 +7,9 @@ a raw queryset update; and access/refresh/pending-2FA tokens expire independentl
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from contextlib import contextmanager
 from datetime import datetime, timedelta
-from typing import Any
 
 import pytest
-from django.dispatch import Signal
 from django.utils import timezone
 from freezegun import freeze_time
 
@@ -28,24 +24,9 @@ from jwt_multiauth.services import (
     TokenService,
 )
 from jwt_multiauth.signals import refresh_reuse_detected, session_revoked, user_logged_in
+from tests.backend.conftest import captured
 
 pytestmark = pytest.mark.django_db
-
-
-@contextmanager
-def captured(signal: Signal) -> Iterator[list[dict[str, Any]]]:
-    """Collects every payload a signal fires with while the context is open, sender included."""
-    received: list[dict[str, Any]] = []
-
-    def _receiver(**kwargs: Any) -> None:
-        kwargs.pop("signal", None)
-        received.append(kwargs)
-
-    signal.connect(_receiver, weak=False)
-    try:
-        yield received
-    finally:
-        signal.disconnect(_receiver)
 
 
 def _request_meta(**overrides: str) -> RequestMeta:

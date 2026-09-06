@@ -53,6 +53,8 @@ def test_partial_user_fields_override_leaves_siblings_at_their_defaults() -> Non
     assert user_fields["PHONE_FIELD"] == "phone"
     assert user_fields["EMAIL_FIELD"] is None
     assert user_fields["IDENTIFIER_FIELDS"] == ["username", "email"]
+    assert user_fields["AUTO_PROVISION_METHODS"] == []
+    assert user_fields["PROVISION_CALLBACK"] is None
 
 
 @pytest.mark.django_db

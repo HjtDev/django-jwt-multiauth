@@ -35,6 +35,12 @@ Eight check IDs:
                                     TWO_FACTOR["ALLOWED_METHODS"] (both closed sets,
                                     docs/CONTRACT.md §12)
                                     -> check_allowed_methods_closed_set
+    jwt_multiauth.E007 (Error)   — USER_FIELDS.AUTO_PROVISION_METHODS is non-empty, no
+                                    PROVISION_CALLBACK is set, and the resolved user model has a
+                                    REQUIRED_FIELDS entry the built-in provisioning default (the
+                                    channel field + USERNAME_FIELD + an unusable password) can't
+                                    fill (docs/CONTRACT.md §11 item 19)
+                                    -> check_auto_provisioning_requirements
     jwt_multiauth.W001 (Warning) — JWT_MULTIAUTH contains a key not present in conf.DEFAULTS
                                     -> check_unknown_settings_keys
 
@@ -244,6 +250,70 @@ def check_allowed_methods_closed_set(app_configs: Any, **kwargs: Any) -> list[Ch
         logger.debug(
             "jwt_multiauth.checks.check_allowed_methods_closed_set: failed to inspect "
             "configured methods",
+            exc_info=True,
+        )
+        return []
+
+
+def _field_can_be_left_unfilled(model: Any, field_name: str) -> bool:
+    """True if leaving ``field_name`` untouched at creation time is safe — it has a default, or
+    it's nullable, or it's blank-able. Not part of this module's public surface.
+    """
+    try:
+        field = model._meta.get_field(field_name)
+    except FieldDoesNotExist:
+        # A REQUIRED_FIELDS entry naming a field that doesn't exist is a different, host-side
+        # bug this check isn't responsible for reporting — treat as "not ours to flag".
+        return True
+    return bool(
+        field.has_default() or getattr(field, "null", False) or getattr(field, "blank", False)
+    )
+
+
+def check_auto_provisioning_requirements(app_configs: Any, **kwargs: Any) -> list[CheckMessage]:
+    """jwt_multiauth.E007 — when ``USER_FIELDS.AUTO_PROVISION_METHODS`` is non-empty and no
+    ``PROVISION_CALLBACK`` is set, verifies every entry in the resolved user model's
+    ``REQUIRED_FIELDS`` can be filled by ``UserProvisioningService``'s built-in default: the
+    channel field (``PHONE_FIELD``/``EMAIL_FIELD``), ``USERNAME_FIELD`` (if different and still
+    empty), and an unusable password. Any OTHER ``REQUIRED_FIELDS`` entry with no default and no
+    way to stay empty would otherwise fail at the first brand-new login, not at ``manage.py
+    check`` time (docs/CONTRACT.md §11 item 19, this repo's CLAUDE.md rule 2).
+
+    A host with ``PROVISION_CALLBACK`` set is exempt — the host owns every field in that case, so
+    this check has nothing to validate against the built-in default at all.
+    """
+    try:
+        user_fields = conf.get_setting("USER_FIELDS")
+        if not user_fields["AUTO_PROVISION_METHODS"] or user_fields["PROVISION_CALLBACK"]:
+            return []
+
+        model = get_user_model()
+        filled_by_default = {model.USERNAME_FIELD}
+        unfillable = sorted(
+            name
+            for name in getattr(model, "REQUIRED_FIELDS", [])
+            if name not in filled_by_default and not _field_can_be_left_unfilled(model, name)
+        )
+        if not unfillable:
+            return []
+
+        return [
+            Error(
+                f'JWT_MULTIAUTH["USER_FIELDS"]["AUTO_PROVISION_METHODS"] is non-empty but '
+                f"{model._meta.label} has REQUIRED_FIELDS the built-in provisioning default "
+                f"can't fill: {', '.join(unfillable)}.",
+                hint=(
+                    'Set JWT_MULTIAUTH["USER_FIELDS"]["PROVISION_CALLBACK"] to a dotted path '
+                    f"that fills every field {model._meta.label} needs, or give "
+                    f"{', '.join(unfillable)} a default — docs/CONTRACT.md §11 item 19."
+                ),
+                id="jwt_multiauth.E007",
+            )
+        ]
+    except Exception:
+        logger.debug(
+            "jwt_multiauth.checks.check_auto_provisioning_requirements: failed to inspect "
+            "provisioning requirements",
             exc_info=True,
         )
         return []
