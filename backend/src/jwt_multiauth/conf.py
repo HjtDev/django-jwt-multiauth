@@ -101,6 +101,15 @@ DEFAULTS: Final[dict[str, Any]] = {
         "EMAIL_FIELD": None,
         "PHONE_FIELD": None,
         "IDENTIFIER_FIELDS": ["username", "email"],
+        # Opt-in, per-method, empty by default: zero behavior change for every host that never
+        # sets it (docs/CONTRACT.md §11 item 19). Drawn from "phone_otp"/"email_otp" only, never
+        # "password" — an unresolved identifier on a listed method is get_or_create()d into a
+        # real account (services.UserProvisioningService) instead of decoyed.
+        "AUTO_PROVISION_METHODS": [],
+        # Dotted path to a host callable (identifier: str, field: str) -> user that fully owns
+        # creation for an AUTO_PROVISION_METHODS method. Unset uses the built-in default in
+        # services.UserProvisioningService.get_or_create (docs/CONTRACT.md §11 item 19).
+        "PROVISION_CALLBACK": None,
     },
 }
 

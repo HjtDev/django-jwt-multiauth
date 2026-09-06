@@ -21,17 +21,28 @@ semver-trigger list).
 from __future__ import annotations
 
 import hmac
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, TypedDict, cast
 
-from django.core.exceptions import ValidationError
+from django.contrib.auth import get_user_model
+from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.db import transaction
 from django.utils import timezone
+from django.utils.module_loading import import_string
 
-from jwt_multiauth import conf, tokens
-from jwt_multiauth.models import AuthSession
-from jwt_multiauth.signals import refresh_reuse_detected, session_revoked, user_logged_in
+from jwt_multiauth import conf, keys, otp, tokens
+from jwt_multiauth.models import AuthSession, OtpChallenge, VerifiedContact
+from jwt_multiauth.signals import (
+    email_otp_requested,
+    otp_verified,
+    phone_otp_requested,
+    refresh_reuse_detected,
+    session_revoked,
+    user_logged_in,
+    user_provisioned,
+)
 
 #: Mirrors AuthSession.revoked_reason's choices (models.py) — kept as a literal here rather than
 #: introspected off the field, since this app's own model shape is not the kind of arbitrary,
@@ -91,6 +102,33 @@ class InvalidRefreshToken(Exception):
     a session that is revoked or expired. Views map this to 401. NOT raised for reuse — see
     RefreshReuseDetected.
     """
+
+
+class ChallengeInvalid(Exception):
+    """Raised by OtpService.verify()/resend() for a challenge_id that doesn't resolve, is
+    expired, is already consumed, has exhausted max_attempts, or (resend only) hasn't cleared its
+    resend cooldown or has exhausted max_resends. Deliberately the SAME exception (and the same
+    view-level 400, details.code="otp_challenge_invalid") for every one of these causes — a decoy
+    challenge_id's "doesn't resolve" case must read identically to a real-but-expired challenge's
+    case (docs/CONTRACT.md §10).
+    """
+
+
+@dataclass(frozen=True)
+class OtpRequestResult:
+    challenge_id: str
+    expires_at: datetime
+    resend_available_at: datetime
+
+
+@dataclass(frozen=True)
+class OtpVerifyResult:
+    user: Any  # AbstractBaseUser — never a concrete import
+    purpose: str
+    created: bool  # True only when THIS call provisioned the user (docs/CONTRACT.md §11 item
+    # 19) — the shared login-response helper (Phase 6) reads this to apply the 2FA-bootstrap
+    # carve-out and to set the response's own created field. False on every non-auto-provisioning
+    # path.
 
 
 class TokenService:
@@ -280,3 +318,390 @@ class TokenService:
             return tokens.decode(token, expected_typ=tokens.TYP_PENDING_2FA)
         except tokens.TokenError as exc:
             raise InvalidPendingToken(str(exc)) from exc
+
+
+def _resolve_user_for_channel(identifier: str, *, channel: str) -> Any | None:
+    """Resolve ``identifier`` against the ONE ``USER_FIELDS`` field this channel maps to —
+    ``EMAIL_FIELD`` for ``"email"``, ``PHONE_FIELD`` for ``"phone"``. Deliberately NOT
+    ``USER_FIELDS.IDENTIFIER_FIELDS``, which is ``PasswordService.authenticate``'s password-login
+    resolution order (docs/CONTRACT.md §4) and has no bearing on an OTP channel. Returns ``None``
+    when the field isn't configured at all (an unresolvable channel behaves exactly like an
+    unresolvable identifier — the decoy/auto-provision fork in ``OtpService.request`` doesn't
+    care which produced the miss) or when no user has that value.
+
+    ``.filter(...).first()`` rather than ``.get()``: ``checks.py``'s E003 already guarantees this
+    field is unique for any *enabled* method in production, but this helper doesn't re-verify that
+    itself — a duplicate value should degrade to "pick one" rather than raise
+    ``MultipleObjectsReturned`` and turn a config gap into a 500.
+    """
+    user_fields = conf.get_setting("USER_FIELDS")
+    field_name = user_fields["EMAIL_FIELD"] if channel == "email" else user_fields["PHONE_FIELD"]
+    if not field_name:
+        return None
+    return get_user_model().objects.filter(**{field_name: identifier}).first()
+
+
+class UserProvisioningService:
+    """docs/CONTRACT.md §11 item 19 — account creation for a phone/email-OTP identifier nobody
+    has seen before, opt-in per method via ``USER_FIELDS.AUTO_PROVISION_METHODS``. Called only
+    from ``OtpService.verify()``. Never imports a concrete user model; every field write goes
+    through ``get_user_model()``/``USER_FIELDS`` resolution, same as every other service here.
+    """
+
+    @staticmethod
+    def get_or_create(identifier: str, *, field: str) -> tuple[Any, bool]:
+        """``field`` is ``"phone"`` or ``"email"`` — whichever ``USER_FIELDS`` entry
+        ``identifier`` was resolved against (the OtpChallenge.channel vocabulary, not the
+        ALLOWED_AUTH_METHODS "email_otp"/"phone_otp" vocabulary).
+
+        Resolution order: (1) ``USER_FIELDS.PROVISION_CALLBACK``, a dotted path to a host
+        callable, if set — the host owns every field, and its return value is passed straight
+        through as this method's own return value. (2) else the built-in default: set the field
+        named by ``PHONE_FIELD``/``EMAIL_FIELD`` to ``identifier``, set the model's
+        ``USERNAME_FIELD`` to ``identifier`` too if it's a different, still-empty field (this is
+        what makes stock ``django.contrib.auth.User`` work, since ``username`` is its
+        ``USERNAME_FIELD`` and a phone number/email is a valid unique value for it), then
+        ``set_unusable_password()`` — the provisioned account must be unreachable via password
+        login until a deliberate reset. Never touches a field this app doesn't itself own — no
+        name, no avatar, no profile anything.
+
+        An unimportable or non-callable ``PROVISION_CALLBACK`` raises ``ImproperlyConfigured``
+        naming the setting — it never silently falls through to the built-in default, which would
+        provision with app defaults when the host meant to own creation entirely (fail loudly,
+        not silently).
+
+        Fires ``user_provisioned`` only when a new row was actually created, never for an
+        existing one.
+        """
+        user_fields = conf.get_setting("USER_FIELDS")
+        callback_path = user_fields["PROVISION_CALLBACK"]
+
+        if callback_path:
+            try:
+                callback = import_string(callback_path)
+            except ImportError as exc:
+                raise ImproperlyConfigured(
+                    f"JWT_MULTIAUTH['USER_FIELDS']['PROVISION_CALLBACK'] = {callback_path!r} "
+                    f"could not be imported: {exc}."
+                ) from exc
+            if not callable(callback):
+                raise ImproperlyConfigured(
+                    f"JWT_MULTIAUTH['USER_FIELDS']['PROVISION_CALLBACK'] = {callback_path!r} "
+                    f"is not callable."
+                )
+            # The host owns every field on the created user, including whether a new row was
+            # actually created and whether user_provisioned is this call's responsibility to
+            # fire — "calls it and returns whatever it returns" (docs/CONTRACT.md §4).
+            result: tuple[Any, bool] = callback(identifier, field=field)
+            return result
+
+        model = get_user_model()
+        field_name = user_fields["PHONE_FIELD"] if field == "phone" else user_fields["EMAIL_FIELD"]
+
+        with transaction.atomic():
+            existing = model.objects.select_for_update().filter(**{field_name: identifier}).first()
+            if existing is not None:
+                return existing, False
+
+            user = model(**{field_name: identifier})
+            username_field = model.USERNAME_FIELD
+            if username_field != field_name and not getattr(user, username_field, None):
+                setattr(user, username_field, identifier)
+            user.set_unusable_password()
+            user.save()
+
+        # Fired after the atomic block above commits (mirrors TokenService.revoke_session, whose
+        # own comment explains why a signal fired from a nested atomic call is safe here: nothing
+        # else in this method writes after it).
+        user_provisioned.send(sender=model, user_id=user.pk, field=field, value=identifier)
+        return user, True
+
+
+class OtpService:
+    """OTP challenge lifecycle — docs/CONTRACT.md §4, implemented in Phase 4. Built on ``otp.py``
+    (pure hashing/generation) plus ``OtpChallenge`` (Phase 2).
+    """
+
+    @staticmethod
+    def request(identifier: str, *, channel: str, purpose: str) -> OtpRequestResult:
+        """Resolves ``identifier`` -> user via the channel's single ``USER_FIELDS`` field. Three
+        outcomes, all returning an IDENTICALLY-shaped ``OtpRequestResult``:
+
+        - Resolves to a real user: honors ``SINGLE_ACTIVE_CHALLENGE`` (invalidates any prior
+          unconsumed challenge for the same user+purpose+channel), persists the row, fires the
+          matching ``*_otp_requested`` signal with the plaintext code.
+        - Does NOT resolve, and the channel's method is NOT in
+          ``USER_FIELDS.AUTO_PROVISION_METHODS``: no database row, no signal — the decoy path.
+          The code is still generated and hashed (comparable CPU cost to the real path), just
+          never persisted or sent.
+        - Does NOT resolve, and the channel's method IS in ``AUTO_PROVISION_METHODS``: persists a
+          REAL row with ``user=None`` and fires the signal with ``user_id=None`` — the identifier
+          may become a real account at ``verify()`` time (docs/CONTRACT.md §11 item 19).
+
+        Never raises for an unknown identifier — the fail-closed rule applies to CREDENTIALS, not
+        to whether an identifier exists, which is exactly what enumeration resistance protects.
+        """
+        method = otp.method_for_channel(channel)
+        auto_provision_methods = conf.get_setting("USER_FIELDS")["AUTO_PROVISION_METHODS"]
+        user = _resolve_user_for_channel(identifier, channel=channel)
+
+        pepper = keys.get_otp_pepper()
+        length = conf.get_otp_setting("LENGTH", channel=channel, purpose=purpose)
+        alphabet = conf.get_otp_setting("ALPHABET", channel=channel, purpose=purpose)
+        exclude_ambiguous = conf.get_otp_setting(
+            "EXCLUDE_AMBIGUOUS", channel=channel, purpose=purpose
+        )
+        case_sensitive = conf.get_otp_setting("CASE_SENSITIVE", channel=channel, purpose=purpose)
+        ttl_seconds = conf.get_otp_setting("TTL_SECONDS", channel=channel, purpose=purpose)
+        max_attempts = conf.get_otp_setting("MAX_ATTEMPTS", channel=channel, purpose=purpose)
+        max_resends = conf.get_otp_setting("MAX_RESENDS", channel=channel, purpose=purpose)
+        resend_cooldown = conf.get_otp_setting(
+            "RESEND_COOLDOWN_SECONDS", channel=channel, purpose=purpose
+        )
+        single_active = conf.get_otp_setting(
+            "SINGLE_ACTIVE_CHALLENGE", channel=channel, purpose=purpose
+        )
+        emit_link_token = conf.get_otp_setting("EMIT_LINK_TOKEN", channel=channel, purpose=purpose)
+
+        # Generated identically on every branch, decoy included, so the decoy path's CPU cost is
+        # comparable to the real path's — never skip straight to "no work needed" for a miss.
+        code = otp.generate_code(
+            length=length,
+            alphabet=alphabet,
+            exclude_ambiguous=exclude_ambiguous,
+            case_sensitive=case_sensitive,
+        )
+        now = timezone.now()
+
+        if user is None and method not in auto_provision_methods:
+            otp.hash_secret(code, pepper=pepper)  # throwaway — comparable CPU cost, nothing kept
+            return OtpRequestResult(
+                challenge_id=str(uuid.uuid4()),
+                expires_at=now + timedelta(seconds=ttl_seconds),
+                resend_available_at=now + timedelta(seconds=resend_cooldown),
+            )
+
+        link_token = otp.generate_link_token() if emit_link_token else None
+
+        with transaction.atomic():
+            if single_active and user is not None:
+                # Must actually invalidate server-side — two valid codes must never coexist for
+                # the same user+purpose+channel. Skipped for user=None rows: there is no user to
+                # scope the query by, and an auto-provision challenge is the only live one for
+                # that never-yet-resolved identifier anyway.
+                OtpChallenge.objects.filter(
+                    user=user, purpose=purpose, channel=channel, consumed_at__isnull=True
+                ).update(consumed_at=now)
+
+            challenge = OtpChallenge.objects.create(
+                user=user,
+                channel=channel,
+                purpose=purpose,
+                destination=identifier,
+                code_hash=otp.hash_secret(code, pepper=pepper),
+                link_token_hash=otp.hash_secret(link_token, pepper=pepper) if link_token else None,
+                max_attempts=max_attempts,
+                max_resends=max_resends,
+                last_sent_at=now,
+                expires_at=now + timedelta(seconds=ttl_seconds),
+            )
+
+        channel_signal = phone_otp_requested if channel == "phone" else email_otp_requested
+        channel_signal.send(
+            sender=OtpChallenge,
+            user_id=user.pk if user is not None else None,
+            destination=identifier,
+            code=code,
+            link_token=link_token,
+            purpose=purpose,
+            challenge_id=str(challenge.challenge_id),
+            expires_at=challenge.expires_at,
+        )
+        return OtpRequestResult(
+            challenge_id=str(challenge.challenge_id),
+            expires_at=challenge.expires_at,
+            resend_available_at=now + timedelta(seconds=resend_cooldown),
+        )
+
+    @staticmethod
+    def verify(
+        challenge_id: str, *, code: str | None = None, link_token: str | None = None
+    ) -> OtpVerifyResult:
+        """Raises ChallengeInvalid for: no such challenge_id (decoy or real-but-gone —
+        identical), expired, already consumed, or attempts >= max_attempts — checked BEFORE the
+        compare, so attempt max_attempts+1 is rejected even if it would have been correct. Uses
+        otp.verify_secret (constant-time) for the actual compare; increments attempts on every
+        failed compare.
+
+        On success, for a row whose user IS NOT None: consumed_at=now, fires otp_verified,
+        returns OtpVerifyResult(user, purpose, created=False). On success, for a row whose user
+        IS None (an auto-provisioned method's previously-unresolved identifier,
+        docs/CONTRACT.md §11 item 19): calls UserProvisioningService.get_or_create, records a
+        VerifiedContact for the field just proven (the OTP was the proof — NOT via
+        VerificationService.confirm(), so contact_verified does not fire for this row), attaches
+        the new user to this OtpChallenge, THEN consumed_at=now, fires otp_verified, returns
+        OtpVerifyResult(user, purpose, created=True).
+
+        Takes no ``purpose`` argument — every caller (PasswordService.confirm_reset,
+        TwoFactorService.verify_second_factor, ...) asserts on the returned ``purpose`` itself.
+        """
+        pepper = keys.get_otp_pepper()
+
+        try:
+            challenge = OtpChallenge.objects.get(pk=challenge_id)
+        except (OtpChallenge.DoesNotExist, ValidationError, ValueError) as exc:
+            # Fast-fail before any cryptographic work or lock: a challenge_id that doesn't
+            # resolve at all (decoy or real-but-deleted) needs no further work to reject, and
+            # nothing has been written yet, so raising directly here (rather than deferring past
+            # an atomic block) is safe.
+            raise ChallengeInvalid("No such OTP challenge.") from exc
+
+        provided = link_token if link_token is not None else code
+        expected_hash = challenge.link_token_hash if link_token is not None else challenge.code_hash
+
+        user: Any = None
+        created = False
+        valid = False
+        purpose = challenge.purpose
+
+        with transaction.atomic():
+            # Re-fetch under lock: the check above is an optimistic fast-fail; this lock is what
+            # makes the actual state transition (attempts increment / consumption) race-safe.
+            challenge = OtpChallenge.objects.select_for_update().get(pk=challenge_id)
+
+            if (
+                challenge.consumed_at is not None
+                or challenge.expires_at <= timezone.now()
+                or challenge.attempts >= challenge.max_attempts
+            ):
+                pass  # valid stays False; nothing to write
+            elif (
+                provided is None
+                or expected_hash is None
+                or not otp.verify_secret(provided, expected_hash, pepper=pepper)
+            ):
+                challenge.attempts += 1
+                challenge.save(update_fields=["attempts"])
+            else:
+                valid = True
+                if challenge.user_id is None:
+                    user, created = UserProvisioningService.get_or_create(
+                        challenge.destination, field=challenge.channel
+                    )
+                    VerifiedContact.objects.get_or_create(
+                        user=user, field=challenge.channel, value=challenge.destination
+                    )
+                    challenge.user = user
+                else:
+                    user = challenge.user
+                challenge.consumed_at = timezone.now()
+                challenge.save(update_fields=["user", "consumed_at"])
+
+        if not valid:
+            raise ChallengeInvalid(
+                "OTP challenge is invalid, expired, consumed, or attempts exhausted."
+            )
+
+        otp_verified.send(
+            sender=OtpChallenge,
+            user_id=user.pk,
+            challenge_id=str(challenge.challenge_id),
+            purpose=purpose,
+        )
+        return OtpVerifyResult(user=user, purpose=purpose, created=created)
+
+    @staticmethod
+    def resend(challenge_id: str) -> OtpRequestResult:
+        """Raises ChallengeInvalid if the challenge doesn't resolve, is already consumed, the
+        resend cooldown hasn't elapsed, or MAX_RESENDS is exhausted. Reuses the same
+        challenge_id/destination; generates a fresh code/hash/expires_at. Does NOT reset
+        ``attempts`` — the attempts budget bounds total guesses against a given challenge_id
+        regardless of how many times its code has been resent, the more conservative reading
+        where the contract is silent.
+        """
+        pepper = keys.get_otp_pepper()
+
+        try:
+            challenge = OtpChallenge.objects.get(pk=challenge_id)
+        except (OtpChallenge.DoesNotExist, ValidationError, ValueError) as exc:
+            raise ChallengeInvalid("No such OTP challenge.") from exc
+
+        channel, purpose = challenge.channel, challenge.purpose
+        cooldown = conf.get_otp_setting("RESEND_COOLDOWN_SECONDS", channel=channel, purpose=purpose)
+
+        valid = False
+        code = ""
+        link_token: str | None = None
+
+        with transaction.atomic():
+            challenge = OtpChallenge.objects.select_for_update().get(pk=challenge_id)
+            now = timezone.now()
+
+            if (
+                challenge.consumed_at is not None
+                or now < challenge.last_sent_at + timedelta(seconds=cooldown)
+                or challenge.resend_count >= challenge.max_resends
+            ):
+                pass  # valid stays False; nothing to write
+            else:
+                length = conf.get_otp_setting("LENGTH", channel=channel, purpose=purpose)
+                alphabet = conf.get_otp_setting("ALPHABET", channel=channel, purpose=purpose)
+                exclude_ambiguous = conf.get_otp_setting(
+                    "EXCLUDE_AMBIGUOUS", channel=channel, purpose=purpose
+                )
+                case_sensitive = conf.get_otp_setting(
+                    "CASE_SENSITIVE", channel=channel, purpose=purpose
+                )
+                ttl_seconds = conf.get_otp_setting("TTL_SECONDS", channel=channel, purpose=purpose)
+                emit_link_token = conf.get_otp_setting(
+                    "EMIT_LINK_TOKEN", channel=channel, purpose=purpose
+                )
+
+                code = otp.generate_code(
+                    length=length,
+                    alphabet=alphabet,
+                    exclude_ambiguous=exclude_ambiguous,
+                    case_sensitive=case_sensitive,
+                )
+                link_token = otp.generate_link_token() if emit_link_token else None
+
+                challenge.code_hash = otp.hash_secret(code, pepper=pepper)
+                challenge.link_token_hash = (
+                    otp.hash_secret(link_token, pepper=pepper) if link_token else None
+                )
+                challenge.expires_at = now + timedelta(seconds=ttl_seconds)
+                challenge.last_sent_at = now
+                challenge.resend_count += 1
+                challenge.save(
+                    update_fields=[
+                        "code_hash",
+                        "link_token_hash",
+                        "expires_at",
+                        "last_sent_at",
+                        "resend_count",
+                    ]
+                )
+                valid = True
+
+        if not valid:
+            raise ChallengeInvalid(
+                "OTP resend is unavailable: challenge is consumed, cooldown hasn't elapsed, or "
+                "resend budget is exhausted."
+            )
+
+        channel_signal = phone_otp_requested if channel == "phone" else email_otp_requested
+        channel_signal.send(
+            sender=OtpChallenge,
+            user_id=challenge.user_id,
+            destination=challenge.destination,
+            code=code,
+            link_token=link_token,
+            purpose=purpose,
+            challenge_id=str(challenge.challenge_id),
+            expires_at=challenge.expires_at,
+        )
+        return OtpRequestResult(
+            challenge_id=str(challenge.challenge_id),
+            expires_at=challenge.expires_at,
+            resend_available_at=timezone.now() + timedelta(seconds=cooldown),
+        )

@@ -5,6 +5,7 @@ it, and only then — the zero-config default (``ALLOWED_AUTH_METHODS = ["passwo
 
 from __future__ import annotations
 
+from typing import ClassVar
 from unittest import mock
 
 from django.test import override_settings
@@ -16,6 +17,7 @@ def test_zero_config_default_is_clean() -> None:
     assert checks.check_user_field_requirements(None) == []
     assert checks.check_totp_requirements(None) == []
     assert checks.check_allowed_methods_closed_set(None) == []
+    assert checks.check_auto_provisioning_requirements(None) == []
     assert checks.check_unknown_settings_keys(None) == []
 
 
@@ -85,6 +87,72 @@ def test_e006_fires_for_unrecognised_login_method() -> None:
 def test_e006_fires_for_unrecognised_two_factor_method() -> None:
     errors = checks.check_allowed_methods_closed_set(None)
     assert any(e.id == "jwt_multiauth.E006" for e in errors)
+
+
+@override_settings(JWT_MULTIAUTH={"USER_FIELDS": {"AUTO_PROVISION_METHODS": ["email_otp"]}})
+def test_e007_fires_when_required_fields_entry_has_no_default() -> None:
+    class _FakeField:
+        null = False
+        blank = False
+
+        def has_default(self) -> bool:
+            return False
+
+    class _FakeMeta:
+        label = "fake_app.FakeUser"
+
+        def get_field(self, name: str) -> _FakeField:
+            return _FakeField()
+
+    class _FakeUser:
+        USERNAME_FIELD = "username"
+        REQUIRED_FIELDS: ClassVar[list[str]] = ["organization"]
+        _meta = _FakeMeta()
+
+    with mock.patch("jwt_multiauth.checks.get_user_model", return_value=_FakeUser):
+        errors = checks.check_auto_provisioning_requirements(None)
+    assert any(e.id == "jwt_multiauth.E007" for e in errors)
+
+
+@override_settings(
+    JWT_MULTIAUTH={
+        "USER_FIELDS": {
+            "AUTO_PROVISION_METHODS": ["email_otp"],
+            "PROVISION_CALLBACK": "some.dotted.callback",
+        }
+    }
+)
+def test_e007_does_not_fire_when_provision_callback_is_set() -> None:
+    # The host owns every field in this case — nothing for this check to validate.
+    class _FakeField:
+        null = False
+        blank = False
+
+        def has_default(self) -> bool:
+            return False
+
+    class _FakeMeta:
+        label = "fake_app.FakeUser"
+
+        def get_field(self, name: str) -> _FakeField:
+            return _FakeField()
+
+    class _FakeUser:
+        USERNAME_FIELD = "username"
+        REQUIRED_FIELDS: ClassVar[list[str]] = ["organization"]
+        _meta = _FakeMeta()
+
+    with mock.patch("jwt_multiauth.checks.get_user_model", return_value=_FakeUser):
+        errors = checks.check_auto_provisioning_requirements(None)
+    assert errors == []
+
+
+@override_settings(JWT_MULTIAUTH={"USER_FIELDS": {"AUTO_PROVISION_METHODS": ["email_otp"]}})
+def test_e007_does_not_fire_for_the_stock_user_models_required_fields() -> None:
+    # django.contrib.auth.User.REQUIRED_FIELDS == ["email"], and User.email has blank=True —
+    # already safe to leave unfilled, so this must stay clean even with AUTO_PROVISION_METHODS set.
+    errors = checks.check_auto_provisioning_requirements(None)
+    assert errors == []
 
 
 @override_settings(JWT_MULTIAUTH={"NOT_A_REAL_TOP_LEVEL_KEY": True})
