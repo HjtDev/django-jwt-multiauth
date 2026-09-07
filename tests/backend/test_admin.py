@@ -11,10 +11,27 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from django.contrib.admin.sites import site as admin_site
+from django.core.cache import cache
+from django.test import override_settings
+from django.utils import timezone
 
 from jwt_multiauth import models as jwt_models
-from jwt_multiauth.admin import AuthSessionAdmin, LoginAttemptAdmin
-from jwt_multiauth.factories import AuthSessionFactory
+from jwt_multiauth.admin import (
+    AuthSessionAdmin,
+    LoginAttemptAdmin,
+    TrustedDeviceAdmin,
+    TwoFactorDeviceAdmin,
+)
+from jwt_multiauth.factories import (
+    AuthSessionFactory,
+    LoginAttemptFactory,
+    TrustedDeviceFactory,
+    TwoFactorDeviceFactory,
+    UserFactory,
+)
+from jwt_multiauth.services import LockoutService
+from jwt_multiauth.signals import two_factor_disabled
+from tests.backend.conftest import captured
 
 SECRET_FIELD_NAMES = {
     "current_jti",
@@ -98,6 +115,132 @@ def test_revoke_sessions_action_calls_token_service_per_unrevoked_row() -> None:
     assert called_ids == {str(unrevoked_1.pk), str(unrevoked_2.pk)}
     for call in mock_revoke.call_args_list:
         assert call.kwargs == {"reason": "admin_revoked"}
+
+
+# ------------------------------------------------------------------ revoke_trusted_devices
+
+
+@pytest.mark.django_db
+def test_revoke_trusted_devices_action_calls_service_per_unrevoked_row() -> None:
+    revoked = TrustedDeviceFactory(token_hash="1" * 64, revoked_at=timezone.now())
+    unrevoked_1 = TrustedDeviceFactory(token_hash="2" * 64)
+    unrevoked_2 = TrustedDeviceFactory(token_hash="3" * 64)
+
+    model_admin = TrustedDeviceAdmin(jwt_models.TrustedDevice, admin_site)
+    queryset = jwt_models.TrustedDevice.objects.filter(
+        pk__in=[revoked.pk, unrevoked_1.pk, unrevoked_2.pk]
+    )
+
+    with patch("jwt_multiauth.admin.TwoFactorService.revoke_trusted_device") as mock_revoke:
+        model_admin.revoke_trusted_devices(MagicMock(), queryset)
+
+    assert mock_revoke.call_count == 2
+    called_devices = {call.args[0] for call in mock_revoke.call_args_list}
+    assert called_devices == {unrevoked_1, unrevoked_2}
+
+
+@pytest.mark.django_db
+def test_revoke_trusted_devices_action_actually_revokes_not_a_raw_update() -> None:
+    device = TrustedDeviceFactory(token_hash="4" * 64)
+    model_admin = TrustedDeviceAdmin(jwt_models.TrustedDevice, admin_site)
+    queryset = jwt_models.TrustedDevice.objects.filter(pk=device.pk)
+
+    model_admin.revoke_trusted_devices(MagicMock(), queryset)
+
+    device.refresh_from_db()
+    assert device.revoked_at is not None
+    # A subsequent lookup of this device by its own (user, token_hash, revoked_at__isnull=True)
+    # triple — the exact shape login_flow._trusted_device_skips_2fa uses to accept the cookie —
+    # no longer resolves, proving the revoke is not merely a display-layer flag.
+    assert not jwt_models.TrustedDevice.objects.filter(
+        pk=device.pk, revoked_at__isnull=True
+    ).exists()
+
+
+# --------------------------------------------------------------------- force_disable_two_factor
+
+
+def test_force_disable_two_factor_permission_is_superuser_only() -> None:
+    model_admin = TwoFactorDeviceAdmin(jwt_models.TwoFactorDevice, admin_site)
+
+    superuser_request = MagicMock()
+    superuser_request.user.is_authenticated = True
+    superuser_request.user.is_superuser = True
+    assert model_admin.has_force_disable_2fa_permission(superuser_request) is True
+
+    staff_request = MagicMock()
+    staff_request.user.is_authenticated = True
+    staff_request.user.is_superuser = False
+    assert model_admin.has_force_disable_2fa_permission(staff_request) is False
+
+
+@pytest.mark.django_db
+def test_force_disable_two_factor_action_calls_service_once_per_distinct_user() -> None:
+    user = UserFactory()
+    device = TwoFactorDeviceFactory(user=user, method="totp")
+
+    model_admin = TwoFactorDeviceAdmin(jwt_models.TwoFactorDevice, admin_site)
+    queryset = jwt_models.TwoFactorDevice.objects.filter(pk=device.pk)
+
+    with patch("jwt_multiauth.admin.TwoFactorService.admin_force_disable") as mock_disable:
+        model_admin.force_disable_two_factor(MagicMock(), queryset)
+
+    mock_disable.assert_called_once_with(user)
+
+
+@pytest.mark.django_db
+def test_force_disable_two_factor_action_actually_disables_and_fires_the_signal() -> None:
+    user = UserFactory()
+    device = TwoFactorDeviceFactory(user=user, method="totp")
+    model_admin = TwoFactorDeviceAdmin(jwt_models.TwoFactorDevice, admin_site)
+    queryset = jwt_models.TwoFactorDevice.objects.filter(pk=device.pk)
+
+    with captured(two_factor_disabled) as received:
+        model_admin.force_disable_two_factor(MagicMock(), queryset)
+
+    device.refresh_from_db()
+    assert device.disabled_at is not None
+    assert any(event["user_id"] == user.pk and event["method"] == "totp" for event in received)
+
+
+# ------------------------------------------------------------------------- unlock_identifiers
+
+
+@pytest.mark.django_db
+def test_unlock_identifiers_action_calls_lockout_service_per_distinct_identifier() -> None:
+    LoginAttemptFactory(identifier="alice", success=False)
+    LoginAttemptFactory(identifier="alice", success=False)  # same identifier, second row
+    LoginAttemptFactory(identifier="bob", success=False)
+
+    model_admin = LoginAttemptAdmin(jwt_models.LoginAttempt, admin_site)
+    queryset = jwt_models.LoginAttempt.objects.all()
+
+    with patch("jwt_multiauth.admin.LockoutService.unlock") as mock_unlock:
+        model_admin.unlock_identifiers(MagicMock(), queryset)
+
+    called_identifiers = {call.args[0] for call in mock_unlock.call_args_list}
+    assert called_identifiers == {"alice", "bob"}
+
+
+@pytest.mark.django_db
+def test_unlock_identifiers_action_actually_clears_the_lock() -> None:
+    cache.clear()
+    with override_settings(
+        JWT_MULTIAUTH={"LOCKOUT": {"LOCK_SCOPE": "identifier", "MAX_ATTEMPTS": 1}}
+    ):
+        LockoutService.record_attempt(
+            "victim", ip="203.0.113.1", success=False, reason="wrong_credential"
+        )
+        assert LockoutService.is_locked("victim", ip="203.0.113.1").locked is True
+
+        LoginAttemptFactory(identifier="victim", success=False)
+        model_admin = LoginAttemptAdmin(jwt_models.LoginAttempt, admin_site)
+        queryset = jwt_models.LoginAttempt.objects.filter(identifier="victim")
+
+        model_admin.unlock_identifiers(MagicMock(), queryset)
+
+        assert LockoutService.is_locked("victim", ip="203.0.113.1").locked is False
+    cache.clear()
 
 
 def test_no_jazzmin_settings_written_by_this_package() -> None:

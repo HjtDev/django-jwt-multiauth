@@ -133,6 +133,30 @@ def tokens_response(
     return pair_response(pair, remember_me=remember_me, created=created)
 
 
+def _set_refresh_cookie(response: Response, refresh: str, *, remember_me: bool) -> None:
+    """Sets the refresh cookie on ``response`` with this app's fixed attributes (``httponly=True``,
+    ``path="/"``) plus the host's configured ``SECURE``/``SAMESITE`` — factored out (Phase 8) so
+    :func:`pair_response` (a fresh login/2FA-verify pair) and :func:`refresh_response`
+    (``POST /token/refresh/``) can never drift on cookie attributes between the two response paths.
+    """
+    cookie_conf = conf.get_setting("REFRESH_COOKIE")
+    tokens_conf = conf.get_setting("TOKENS")
+    max_age = (
+        tokens_conf["REMEMBER_ME_TTL_SECONDS"]
+        if remember_me
+        else tokens_conf["REFRESH_TTL_SECONDS"]
+    )
+    response.set_cookie(
+        cookie_conf["NAME"],
+        refresh,
+        max_age=max_age,
+        httponly=True,
+        secure=cookie_conf["SECURE"],
+        samesite=cookie_conf["SAMESITE"],
+        path="/",
+    )
+
+
 def pair_response(pair: Any, *, remember_me: bool, created: bool) -> Response:
     """Builds the HTTP response (body + refresh cookie, per ``REFRESH_COOKIE["TRANSPORT"]``) for
     an ALREADY-ISSUED token pair — the shared tail of :func:`tokens_response` (a brand-new pair,
@@ -155,22 +179,8 @@ def pair_response(pair: Any, *, remember_me: bool, created: bool) -> Response:
         body["refresh"] = pair.refresh
         response = Response(body)
     else:
-        tokens_conf = conf.get_setting("TOKENS")
-        max_age = (
-            tokens_conf["REMEMBER_ME_TTL_SECONDS"]
-            if remember_me
-            else tokens_conf["REFRESH_TTL_SECONDS"]
-        )
         response = Response(body)
-        response.set_cookie(
-            cookie_conf["NAME"],
-            pair.refresh,
-            max_age=max_age,
-            httponly=True,
-            secure=cookie_conf["SECURE"],
-            samesite=cookie_conf["SAMESITE"],
-            path="/",
-        )
+        _set_refresh_cookie(response, pair.refresh, remember_me=remember_me)
 
     trusted_device_token = getattr(pair, "trusted_device_token", None)
     if trusted_device_token:
@@ -186,3 +196,58 @@ def pair_response(pair: Any, *, remember_me: bool, created: bool) -> Response:
         )
 
     return response
+
+
+def read_refresh_token(request: Request) -> str | None:
+    """Reads the refresh token per ``REFRESH_COOKIE["TRANSPORT"]`` (Phase 8,
+    ``POST /token/refresh/``) — the cookie under the default ``"cookie"`` transport,
+    ``request.data["refresh"]`` under ``"body"``. Returns ``None`` for a missing, empty, or
+    non-string value either way; never raises — a missing refresh token is
+    ``views_token.TokenRefreshView``'s own ``401`` (the same shape as any other
+    ``InvalidRefreshToken``), not a distinguishable ``400``.
+    """
+    cookie_conf = conf.get_setting("REFRESH_COOKIE")
+    if cookie_conf["TRANSPORT"] == "body":
+        # request.data is typed dict[str, Any] | list[Any] — DRF only ever populates a list for
+        # a bulk-list body shape, never for this app's own single-object serializers, but the
+        # isinstance check keeps this honest for mypy strict rather than asserting it away.
+        data = request.data
+        token = data.get("refresh") if isinstance(data, dict) else None
+        return token if isinstance(token, str) and token else None
+    token = request.COOKIES.get(cookie_conf["NAME"])
+    return token or None
+
+
+def refresh_response(pair: Any, *, remember_me: bool) -> Response:
+    """Builds the ``POST /token/refresh/`` response (``docs/CONTRACT.md`` §5: ``200 {access,
+    session_id}``, re-sets the cookie) — a separate function from :func:`pair_response` rather
+    than threading a ``created`` parameter through it, since a refresh is never a fresh login and
+    has no meaningful value for ``created`` to report at all (the contract's own row for this
+    endpoint lists no ``created`` key).
+    """
+    body: dict[str, Any] = {"access": pair.access, "session_id": pair.session_id}
+
+    cookie_conf = conf.get_setting("REFRESH_COOKIE")
+    if cookie_conf["TRANSPORT"] == "body":
+        body["refresh"] = pair.refresh
+        response = Response(body)
+    else:
+        response = Response(body)
+        _set_refresh_cookie(response, pair.refresh, remember_me=remember_me)
+
+    return response
+
+
+def clear_auth_cookies(response: Response) -> None:
+    """Clears both the refresh cookie and the trusted-device cookie (``docs/CONTRACT.md`` §5:
+    ``POST /logout/`` "clears cookies", plural) — matching the ``path="/"`` every set-cookie call
+    above uses, or the browser never actually deletes them. Safe to call unconditionally: deleting
+    a cookie the client never set (e.g. under ``REFRESH_COOKIE["TRANSPORT"] == "body"``, or a
+    caller who never opted into a trusted device) is a harmless no-op.
+    """
+    cookie_conf = conf.get_setting("REFRESH_COOKIE")
+    trusted_device_conf = conf.get_setting("TWO_FACTOR")["TRUSTED_DEVICE"]
+    response.delete_cookie(cookie_conf["NAME"], path="/", samesite=cookie_conf["SAMESITE"])
+    response.delete_cookie(
+        trusted_device_conf["COOKIE_NAME"], path="/", samesite=cookie_conf["SAMESITE"]
+    )

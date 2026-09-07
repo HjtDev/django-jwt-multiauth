@@ -3,9 +3,200 @@ info:
   title: jwt_multiauth
   version: 0.0.0
 paths:
+  /api/v1/admin/auth/login-attempts/:
+    get:
+      operationId: admin_auth_login_attempts_list
+      description: |-
+        ``GET /admin/login-attempts/``. Filterable by ``identifier``/``ip_address``/``user``/
+        ``success``.
+      summary: List login attempts
+      parameters:
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - name: page_size
+        required: false
+        in: query
+        description: Number of results to return per page.
+        schema:
+          type: integer
+      tags:
+      - jwt-multiauth-admin
+      security:
+      - jwtMultiauthBearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedLoginAttemptList'
+          description: ''
+  /api/v1/admin/auth/sessions/:
+    get:
+      operationId: admin_auth_sessions_list
+      description: '``GET /admin/sessions/``. Any user''s rows, filterable by ``?user=``.'
+      summary: List any user's sessions
+      parameters:
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - name: page_size
+        required: false
+        in: query
+        description: Number of results to return per page.
+        schema:
+          type: integer
+      tags:
+      - jwt-multiauth-admin
+      security:
+      - jwtMultiauthBearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedAuthSessionList'
+          description: ''
+  /api/v1/admin/auth/sessions/{id}/:
+    delete:
+      operationId: admin_auth_sessions_destroy
+      description: '``DELETE /admin/sessions/{id}/``. Any user''s session.'
+      summary: Revoke any user's session
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - jwt-multiauth-admin
+      security:
+      - jwtMultiauthBearerAuth: []
+      responses:
+        '204':
+          description: No response body
+        '404':
+          description: No such session.
+  /api/v1/admin/auth/trusted-devices/:
+    get:
+      operationId: admin_auth_trusted_devices_list
+      description: |-
+        ``GET /admin/trusted-devices/``. Any user's rows, filterable by ``?user=`` —
+        ``docs/CONTRACT.md`` §11 item 2 (the same gap item 18 flags for the self-service pair).
+      summary: List any user's trusted devices
+      parameters:
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - name: page_size
+        required: false
+        in: query
+        description: Number of results to return per page.
+        schema:
+          type: integer
+      tags:
+      - jwt-multiauth-admin
+      security:
+      - jwtMultiauthBearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedTrustedDeviceList'
+          description: ''
+  /api/v1/admin/auth/trusted-devices/{id}/:
+    delete:
+      operationId: admin_auth_trusted_devices_destroy
+      description: '``DELETE /admin/trusted-devices/{id}/``. Any user''s trusted device.'
+      summary: Revoke any user's trusted device
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - jwt-multiauth-admin
+      security:
+      - jwtMultiauthBearerAuth: []
+      responses:
+        '204':
+          description: No response body
+        '404':
+          description: No such trusted device.
+  /api/v1/admin/auth/users/{id}/2fa/force-disable/:
+    post:
+      operationId: admin_auth_users_2fa_force_disable_create
+      description: is_superuser-only, unconditionally — never satisfied by plain is_staff.
+      summary: Force-disable every 2FA method for a user
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - jwt-multiauth-admin
+      security:
+      - jwtMultiauthBearerAuth: []
+      responses:
+        '204':
+          description: No response body
+  /api/v1/admin/auth/users/{id}/security/:
+    get:
+      operationId: admin_auth_users_security_retrieve
+      description: '``GET /admin/users/{id}/security/``. A read-only aggregate — no
+        model of its own.'
+      summary: Get a user's 2FA status, active session count, and lock status
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - jwt-multiauth-admin
+      security:
+      - jwtMultiauthBearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminUserSecurityResponse'
+          description: ''
+  /api/v1/admin/auth/users/{id}/unlock/:
+    post:
+      operationId: admin_auth_users_unlock_create
+      description: '``POST /admin/users/{id}/unlock/``.'
+      summary: Clear a user's lockout, across every identifier they could have typed
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - jwt-multiauth-admin
+      security:
+      - jwtMultiauthBearerAuth: []
+      responses:
+        '204':
+          description: No response body
   /api/v1/auth/2fa/disable/:
     post:
-      operationId: 2fa_disable_create
+      operationId: auth_2fa_disable_create
       description: Requires the caller's current password as a re-auth step.
       summary: Disable one enrolled 2FA method
       tags:
@@ -31,7 +222,7 @@ paths:
           description: method is not currently enrolled, or an incorrect password.
   /api/v1/auth/2fa/otp/request/:
     post:
-      operationId: 2fa_otp_request_create
+      operationId: auth_2fa_otp_request_create
       description: |-
         ``POST /2fa/otp/request/`` — not in ``docs/CONTRACT.md``'s frozen §5 table (see this
         module's own docstring). Gated by the pending token itself rather than an identifier: no
@@ -64,7 +255,7 @@ paths:
           description: Invalid/expired pending token, or method not eligible.
   /api/v1/auth/2fa/recovery-codes/regenerate/:
     post:
-      operationId: 2fa_recovery_codes_regenerate_create
+      operationId: auth_2fa_recovery_codes_regenerate_create
       description: Requires the caller's current password as a re-auth step. Returns
         the PLAINTEXT codes once — never retrievable again.
       summary: Regenerate the caller's recovery codes
@@ -95,7 +286,7 @@ paths:
           description: Incorrect password.
   /api/v1/auth/2fa/status/:
     get:
-      operationId: 2fa_status_retrieve
+      operationId: auth_2fa_status_retrieve
       description: '`enrolled_methods` is what the caller has actually set up; `eligible_methods`
         is that set filtered by the host''s current TWO_FACTOR["ALLOWED_METHODS"].'
       summary: Get the caller's own 2FA enrollment and eligibility status
@@ -112,7 +303,7 @@ paths:
           description: ''
   /api/v1/auth/2fa/totp/confirm/:
     post:
-      operationId: 2fa_totp_confirm_create
+      operationId: auth_2fa_totp_confirm_create
       description: |-
         ``POST /2fa/totp/confirm/``. Rejects a confirm attempt against an already-confirmed
         device, or with no pending enrollment at all, with the same ``400`` shape as a wrong code —
@@ -141,7 +332,7 @@ paths:
           description: No pending enrollment, already confirmed, or an invalid code.
   /api/v1/auth/2fa/totp/enroll/:
     post:
-      operationId: 2fa_totp_enroll_create
+      operationId: auth_2fa_totp_enroll_create
       description: Returns a plaintext secret and an otpauth:// URI, once. A prior
         unconfirmed (or disabled) enrollment is silently replaced. Confirm with POST
         /2fa/totp/confirm/ before this method counts toward eligible_methods.
@@ -171,7 +362,7 @@ paths:
           description: ''
   /api/v1/auth/2fa/verify/:
     post:
-      operationId: 2fa_verify_create
+      operationId: auth_2fa_verify_create
       description: Exactly one of `code`/`link_token` is required. `challenge_id`
         is required for email_otp/phone_otp (obtained from POST /2fa/otp/request/).
         The server re-derives eligible methods itself — a client-claimed `method`
@@ -200,9 +391,71 @@ paths:
           description: '{access, session_id, created}.'
         '401':
           description: Invalid/consumed pending token, or method not eligible/verified.
+  /api/v1/auth/account/verify-contact/confirm/:
+    post:
+      operationId: auth_account_verify_contact_confirm_create
+      description: |-
+        ``POST /account/verify-contact/confirm/``. An unresolved/expired/wrong-purpose challenge,
+        and one verified by a different user than the caller, all produce the identical
+        ``otp_challenge_invalid`` shape — same rule ``OtpVerifyView`` applies to its own challenges.
+      summary: Confirm a contact-verification OTP challenge
+      tags:
+      - jwt-multiauth
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyContactConfirmRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/VerifyContactConfirmRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/VerifyContactConfirmRequest'
+        required: true
+      security:
+      - jwtMultiauthBearerAuth: []
+      responses:
+        '204':
+          description: No response body
+        '400':
+          description: Invalid, expired, or wrong-purpose challenge.
+  /api/v1/auth/account/verify-contact/request/:
+    post:
+      operationId: auth_account_verify_contact_request_create
+      description: |-
+        ``POST /account/verify-contact/request/``. No decoy path — the caller is already
+        authenticated, so the identifier being verified always resolves (to themselves).
+      summary: Request an OTP challenge to verify the caller's own email or phone
+      tags:
+      - jwt-multiauth
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyContactRequestRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/VerifyContactRequestRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/VerifyContactRequestRequest'
+        required: true
+      security:
+      - jwtMultiauthBearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OtpRequestResponse'
+          description: ''
+        '400':
+          description: field isn't configured on this host, or the caller has no current
+            value for it.
   /api/v1/auth/login/:
     post:
-      operationId: login_create
+      operationId: auth_login_create
       description: Authenticates with a password. Returns real tokens directly when
         no second factor is required, or a pending_2fa handshake (`pending_token`,
         `eligible_methods`) when it is. An unknown identifier and a known identifier
@@ -236,9 +489,55 @@ paths:
         '401':
           description: Invalid credentials, a locked account, or 2FA required with
             no eligible second factor.
+  /api/v1/auth/logout/:
+    post:
+      operationId: auth_logout_create
+      description: |-
+        ``POST /logout/``. Revokes the CALLER's own current session only — identified from the
+        access token's own ``sid`` claim (``request.auth``, populated by ``JWTAuthentication``), never
+        from a request body — and clears both auth cookies. This view is ``user_logged_out``'s sole
+        emitter (``signals.py``).
+      summary: Log out the caller's current session
+      tags:
+      - jwt-multiauth
+      security:
+      - jwtMultiauthBearerAuth: []
+      responses:
+        '204':
+          description: No response body
+  /api/v1/auth/logout/all/:
+    post:
+      operationId: auth_logout_all_create
+      description: |-
+        ``POST /logout/all/``. Revokes every session for the caller, including the one making this
+        request.
+      summary: Log out every session for the caller
+      tags:
+      - jwt-multiauth
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LogoutAllResponseRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/LogoutAllResponseRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/LogoutAllResponseRequest'
+        required: true
+      security:
+      - jwtMultiauthBearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LogoutAllResponse'
+          description: ''
   /api/v1/auth/methods/:
     get:
-      operationId: methods_retrieve
+      operationId: auth_methods_retrieve
       description: Unauthenticated discovery endpoint — returns which login methods
         and 2FA policy this deployment has enabled. The same response for every caller;
         cached accordingly.
@@ -256,7 +555,7 @@ paths:
           description: ''
   /api/v1/auth/otp/request/:
     post:
-      operationId: otp_request_create
+      operationId: auth_otp_request_create
       description: Real or decoy, indistinguishably — this endpoint never reveals
         whether `identifier` resolves to a real account. 400 only when `channel`'s
         auth method isn't enabled.
@@ -288,7 +587,7 @@ paths:
           description: channel's auth method is not in ALLOWED_AUTH_METHODS.
   /api/v1/auth/otp/resend/:
     post:
-      operationId: otp_resend_create
+      operationId: auth_otp_resend_create
       description: Reuses the same challenge_id/destination with a fresh code and
         expiry.
       summary: Resend an OTP challenge's code
@@ -319,7 +618,7 @@ paths:
           description: Invalid challenge, cooldown not elapsed, or MAX_RESENDS exhausted.
   /api/v1/auth/otp/verify/:
     post:
-      operationId: otp_verify_create
+      operationId: auth_otp_verify_create
       description: Exactly one of `code`/`link_token` is required. Returns the same
         shape as `/login/`. `created` is `true` only when this call just auto-provisioned
         a new account for an unrecognized identifier on an AUTO_PROVISION_METHODS-enabled
@@ -355,7 +654,7 @@ paths:
           description: 2FA required with no eligible second factor.
   /api/v1/auth/password/change/:
     post:
-      operationId: password_change_create
+      operationId: auth_password_change_create
       description: Requires the current password. Revokes every session for this user,
         including the one making this request — the client must log in again afterward.
       summary: Change the authenticated user's password
@@ -383,7 +682,7 @@ paths:
             validator.
   /api/v1/auth/password/reset/confirm/:
     post:
-      operationId: password_reset_confirm_create
+      operationId: auth_password_reset_confirm_create
       description: Exactly one of `code`/`link_token` is required.
       summary: Confirm a password reset with an OTP code or magic-link token
       tags:
@@ -410,7 +709,7 @@ paths:
             validator.
   /api/v1/auth/password/reset/request/:
     post:
-      operationId: password_reset_request_create
+      operationId: auth_password_reset_request_create
       description: Always returns 200, whether or not `identifier` resolves to a real
         account — this endpoint never reveals account existence.
       summary: Request a password reset OTP challenge
@@ -433,8 +732,190 @@ paths:
       responses:
         '200':
           description: Always returned, unconditionally.
+  /api/v1/auth/sessions/:
+    get:
+      operationId: auth_sessions_list
+      description: |-
+        ``GET /sessions/``. Lists the CALLER's own ``AuthSession`` rows only, filtered at the
+        queryset level.
+      summary: List the caller's own sessions
+      parameters:
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - name: page_size
+        required: false
+        in: query
+        description: Number of results to return per page.
+        schema:
+          type: integer
+      tags:
+      - jwt-multiauth
+      security:
+      - jwtMultiauthBearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedAuthSessionList'
+          description: ''
+  /api/v1/auth/sessions/{id}/:
+    delete:
+      operationId: auth_sessions_destroy
+      description: |-
+        ``DELETE /sessions/{id}/``. ``404``, never ``403``, for a session id that exists but isn't
+        the caller's own — see this module's own docstring.
+      summary: Revoke one of the caller's own sessions
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - jwt-multiauth
+      security:
+      - jwtMultiauthBearerAuth: []
+      responses:
+        '204':
+          description: No response body
+        '404':
+          description: No such session, or it isn't the caller's own.
+  /api/v1/auth/token/refresh/:
+    post:
+      operationId: auth_token_refresh_create
+      description: Reads the refresh token from the cookie (default transport) or
+        the request body (REFRESH_COOKIE['TRANSPORT'] == 'body'). Re-sets the cookie
+        on success. A replayed (already-rotated) refresh token revokes the whole session
+        and fires refresh_reuse_detected.
+      summary: Rotate a refresh token for a fresh access token
+      tags:
+      - jwt-multiauth
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TokenRefreshRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/TokenRefreshRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/TokenRefreshRequest'
+      security:
+      - jwtMultiauthBearerAuth: []
+      - {}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenRefreshResponse'
+          description: ''
+        '401':
+          description: Missing, invalid, expired, or reused refresh token.
+  /api/v1/auth/token/verify/:
+    post:
+      operationId: auth_token_verify_create
+      description: 'Always 200. Returns {valid: true, claims} for a live, correctly-signed
+        access token, or {valid: false} for anything else — expired, malformed, wrong
+        typ, or tampered.'
+      summary: Verify an access token without authenticating as it
+      tags:
+      - jwt-multiauth
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TokenVerifyRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/TokenVerifyRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/TokenVerifyRequest'
+        required: true
+      security:
+      - {}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenVerifyResponse'
+          description: ''
+  /api/v1/auth/trusted-devices/:
+    get:
+      operationId: auth_trusted_devices_list
+      description: '``GET /trusted-devices/``. Lists the CALLER''s own ``TrustedDevice``
+        rows only.'
+      summary: List the caller's own trusted devices
+      parameters:
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - name: page_size
+        required: false
+        in: query
+        description: Number of results to return per page.
+        schema:
+          type: integer
+      tags:
+      - jwt-multiauth
+      security:
+      - jwtMultiauthBearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedTrustedDeviceList'
+          description: ''
+  /api/v1/auth/trusted-devices/{id}/:
+    delete:
+      operationId: auth_trusted_devices_destroy
+      description: |-
+        ``DELETE /trusted-devices/{id}/``. Same ownership-check pattern as
+        ``SessionRevokeView`` — ``404``, never ``403``, for a device id that isn't the caller's own.
+      summary: Revoke one of the caller's own trusted devices
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - jwt-multiauth
+      security:
+      - jwtMultiauthBearerAuth: []
+      responses:
+        '204':
+          description: No response body
+        '404':
+          description: No such trusted device, or it isn't the caller's own.
 components:
   schemas:
+    AdminUserSecurityResponse:
+      type: object
+      properties:
+        two_factor_status:
+          $ref: '#/components/schemas/TwoFactorStatusResponse'
+        active_session_count:
+          type: integer
+        lock_status:
+          $ref: '#/components/schemas/LockStatusResponse'
+      required:
+      - active_session_count
+      - lock_status
+      - two_factor_status
     AuthMethodsResponse:
       type: object
       properties:
@@ -447,14 +928,112 @@ components:
       required:
       - allowed_auth_methods
       - two_factor
-    ChannelEnum:
-      enum:
-      - email
-      - phone
-      type: string
+    AuthSession:
+      type: object
       description: |-
-        * `email` - email
-        * `phone` - phone
+        ``GET /sessions/``/``GET /admin/sessions/`` row shape — Phase 8. ``current_jti`` is never
+        present here (this repo's ``CLAUDE.md`` rule 4: a refresh token's secret component).
+      properties:
+        id:
+          type: string
+        device_label:
+          type: string
+        ip_address:
+          type: string
+        user_agent:
+          type: string
+        remember_me:
+          type: boolean
+        rotation_count:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        last_used_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        revoked_at:
+          type: string
+          format: date-time
+          nullable: true
+        revoked_reason:
+          type: string
+          nullable: true
+      required:
+      - created_at
+      - device_label
+      - expires_at
+      - id
+      - ip_address
+      - last_used_at
+      - remember_me
+      - revoked_at
+      - revoked_reason
+      - rotation_count
+      - user_agent
+    LockStatusResponse:
+      type: object
+      description: |-
+        ``AdminUserSecurityResponseSerializer.lock_status`` — Phase 8, not specified by
+        ``docs/CONTRACT.md`` §5 beyond the key's name. ``locked``/``until`` are ``null`` when
+        ``LOCKOUT["LOCK_SCOPE"]`` is ``"identifier_and_ip"``/``"ip"``, where no single IP answers "is
+        this USER locked?" — never a possibly-wrong ``false`` (this repo's ``CLAUDE.md`` rule 3: fail
+        closed rather than silently assert a security state this app cannot actually verify).
+      properties:
+        scope:
+          type: string
+        locked:
+          type: boolean
+          nullable: true
+        until:
+          type: string
+          format: date-time
+          nullable: true
+      required:
+      - locked
+      - scope
+      - until
+    LoginAttempt:
+      type: object
+      description: |-
+        ``GET /admin/login-attempts/`` row shape — Phase 8. ``user`` is ``null`` for an
+        ``identifier`` that never resolved to a real account (``models.LoginAttempt``'s own
+        docstring) — the one model where that distinction is recorded at all.
+      properties:
+        id:
+          type: integer
+        user:
+          type: integer
+          nullable: true
+        identifier:
+          type: string
+        method:
+          type: string
+        ip_address:
+          type: string
+        user_agent:
+          type: string
+        success:
+          type: boolean
+        failure_reason:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+      required:
+      - created_at
+      - failure_reason
+      - id
+      - identifier
+      - ip_address
+      - method
+      - success
+      - user
+      - user_agent
     LoginPendingTwoFactorResponse:
       type: object
       description: |-
@@ -510,6 +1089,28 @@ components:
       - access
       - created
       - session_id
+    LogoutAllResponse:
+      type: object
+      properties:
+        revoked_count:
+          type: integer
+      required:
+      - revoked_count
+    LogoutAllResponseRequest:
+      type: object
+      properties:
+        revoked_count:
+          type: integer
+      required:
+      - revoked_count
+    OtpChannelEnum:
+      enum:
+      - email
+      - phone
+      type: string
+      description: |-
+        * `email` - email
+        * `phone` - phone
     OtpRequestRequest:
       type: object
       properties:
@@ -517,7 +1118,7 @@ components:
           type: string
           minLength: 1
         channel:
-          $ref: '#/components/schemas/ChannelEnum'
+          $ref: '#/components/schemas/OtpChannelEnum'
       required:
       - channel
       - identifier
@@ -564,6 +1165,75 @@ components:
       oneOf:
       - $ref: '#/components/schemas/LoginTokensResponse'
       - $ref: '#/components/schemas/LoginPendingTwoFactorResponse'
+    PaginatedAuthSessionList:
+      type: object
+      required:
+      - count
+      - results
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuthSession'
+    PaginatedLoginAttemptList:
+      type: object
+      required:
+      - count
+      - results
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/LoginAttempt'
+    PaginatedTrustedDeviceList:
+      type: object
+      required:
+      - count
+      - results
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrustedDevice'
     PasswordChangeRequest:
       type: object
       properties:
@@ -627,6 +1297,55 @@ components:
             type: string
       required:
       - codes
+    TokenRefreshRequest:
+      type: object
+      description: |-
+        ``POST /token/refresh/`` request body — Phase 8. ``refresh`` is used only under
+        ``REFRESH_COOKIE["TRANSPORT"] == "body"``; under the default ``"cookie"`` transport the
+        refresh token is read from the cookie instead (``login_flow.read_refresh_token``), never
+        from this field, so it stays optional here regardless of transport.
+      properties:
+        refresh:
+          type: string
+          writeOnly: true
+          minLength: 1
+    TokenRefreshResponse:
+      type: object
+      description: |-
+        ``docs/CONTRACT.md`` §5's ``200 {access, session_id}`` — deliberately no ``created`` key,
+        unlike ``LoginTokensResponseSerializer``: a refresh is never a fresh login.
+      properties:
+        access:
+          type: string
+        refresh:
+          type: string
+        session_id:
+          type: string
+      required:
+      - access
+      - session_id
+    TokenVerifyRequest:
+      type: object
+      properties:
+        token:
+          type: string
+          writeOnly: true
+          minLength: 1
+      required:
+      - token
+    TokenVerifyResponse:
+      type: object
+      description: |-
+        ``valid: false`` responses omit ``claims`` entirely — there is nothing trustworthy to
+        return once verification fails.
+      properties:
+        valid:
+          type: boolean
+        claims:
+          type: object
+          additionalProperties: {}
+      required:
+      - valid
     TotpConfirmRequest:
       type: object
       properties:
@@ -664,6 +1383,36 @@ components:
       required:
       - otpauth_uri
       - secret
+    TrustedDevice:
+      type: object
+      description: |-
+        ``GET /trusted-devices/``/``GET /admin/trusted-devices/`` row shape — Phase 8.
+        ``token_hash`` is never present here (this repo's ``CLAUDE.md`` rule 4).
+      properties:
+        id:
+          type: integer
+        device_label:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        last_used_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        revoked_at:
+          type: string
+          format: date-time
+          nullable: true
+      required:
+      - created_at
+      - device_label
+      - expires_at
+      - id
+      - last_used_at
+      - revoked_at
     TwoFactorDisableRequest:
       type: object
       properties:
@@ -776,6 +1525,26 @@ components:
       required:
       - method
       - pending_token
+    VerifyContactConfirmRequest:
+      type: object
+      properties:
+        challenge_id:
+          type: string
+          minLength: 1
+        code:
+          type: string
+          writeOnly: true
+          minLength: 1
+      required:
+      - challenge_id
+      - code
+    VerifyContactRequestRequest:
+      type: object
+      properties:
+        field:
+          $ref: '#/components/schemas/OtpChannelEnum'
+      required:
+      - field
   securitySchemes:
     jwtMultiauthBearerAuth:
       type: http

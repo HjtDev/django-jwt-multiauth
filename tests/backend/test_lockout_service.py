@@ -223,3 +223,79 @@ def test_unlock_clears_the_lock_and_resets_the_counter() -> None:
 def test_unlock_is_idempotent() -> None:
     LockoutService.unlock("never-locked-anyone")
     LockoutService.unlock("never-locked-anyone")  # must not raise
+
+
+# ------------------------------------------------------------------------------ unlock_user
+
+
+@override_settings(JWT_MULTIAUTH=_lockout_settings(LOCK_SCOPE="identifier"))
+def test_unlock_user_clears_a_lock_recorded_under_the_users_email_not_just_username() -> None:
+    user = UserFactory(username="alice", email="alice@example.com")
+    for _ in range(3):
+        LockoutService.record_attempt(
+            "alice@example.com", ip="203.0.113.1", success=False, reason="wrong_credential"
+        )
+    assert LockoutService.is_locked("alice@example.com", ip="203.0.113.1").locked is True
+
+    unlocked = LockoutService.unlock_user(user)
+
+    assert "alice@example.com" in unlocked
+    assert "alice" in unlocked
+    assert LockoutService.is_locked("alice@example.com", ip="203.0.113.1").locked is False
+
+
+@override_settings(JWT_MULTIAUTH=_lockout_settings())
+def test_unlock_user_with_no_configured_identifier_values_returns_empty_list() -> None:
+    from django.contrib.auth import get_user_model
+
+    user = get_user_model()(username="")
+    assert LockoutService.unlock_user(user) == []
+
+
+# ------------------------------------------------------------------------ lock_status_for_user
+
+
+@override_settings(JWT_MULTIAUTH=_lockout_settings(LOCK_SCOPE="identifier"))
+def test_lock_status_for_user_reports_a_real_status_under_identifier_scope() -> None:
+    user = UserFactory(username="victim")
+    for _ in range(3):
+        LockoutService.record_attempt(
+            "victim", ip="203.0.113.1", success=False, reason="wrong_credential"
+        )
+
+    scope, status = LockoutService.lock_status_for_user(user)
+
+    assert scope == "identifier"
+    assert status is not None
+    assert status.locked is True
+    assert status.until is not None
+
+
+@override_settings(JWT_MULTIAUTH=_lockout_settings(LOCK_SCOPE="identifier"))
+def test_lock_status_for_user_reports_not_locked_when_no_lock_is_active() -> None:
+    user = UserFactory(username="innocent")
+    scope, status = LockoutService.lock_status_for_user(user)
+    assert scope == "identifier"
+    assert status == LockStatus(locked=False, until=None)
+
+
+@override_settings(JWT_MULTIAUTH=_lockout_settings(LOCK_SCOPE="identifier_and_ip"))
+def test_lock_status_for_user_is_indeterminate_under_identifier_and_ip_scope() -> None:
+    user = UserFactory(username="victim")
+    for _ in range(3):
+        LockoutService.record_attempt(
+            "victim", ip="203.0.113.1", success=False, reason="wrong_credential"
+        )
+
+    scope, status = LockoutService.lock_status_for_user(user)
+
+    assert scope == "identifier_and_ip"
+    assert status is None  # never a possibly-wrong guess
+
+
+@override_settings(JWT_MULTIAUTH=_lockout_settings(LOCK_SCOPE="ip"))
+def test_lock_status_for_user_is_indeterminate_under_ip_scope() -> None:
+    user = UserFactory(username="victim")
+    scope, status = LockoutService.lock_status_for_user(user)
+    assert scope == "ip"
+    assert status is None

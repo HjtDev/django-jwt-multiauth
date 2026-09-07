@@ -22,6 +22,7 @@ from django.db.models import QuerySet
 from django.http import HttpRequest
 from django.utils.translation import gettext_lazy as _
 
+from jwt_multiauth import permissions as jwt_permissions
 from jwt_multiauth.models import (
     AuthSession,
     LoginAttempt,
@@ -31,7 +32,7 @@ from jwt_multiauth.models import (
     TwoFactorDevice,
     VerifiedContact,
 )
-from jwt_multiauth.services import TokenService
+from jwt_multiauth.services import LockoutService, TokenService, TwoFactorService
 
 
 @admin.register(OtpChallenge)
@@ -137,7 +138,12 @@ class AuthSessionAdmin(admin.ModelAdmin):
 @admin.register(TwoFactorDevice)
 class TwoFactorDeviceAdmin(admin.ModelAdmin):
     """``secret_encrypted`` is a secret (this repo's ``CLAUDE.md`` rule 4) — absent from every
-    attribute below, not truncated, not masked: absent.
+    attribute below, not truncated, not masked: absent. ``force_disable_two_factor`` is
+    ``is_superuser``-only via ``permissions.is_superuser`` — the SAME always-on check
+    ``permissions.IsSuperUser`` uses for the REST route, never the configurable
+    ``ADMIN_REQUIRES_SUPERUSER`` gate (Phase 8, ``docs/CONTRACT.md`` §11 item 18). Calls
+    ``TwoFactorService.admin_force_disable``, never a raw ``queryset.delete()`` — a raw delete
+    would skip the service and never fire ``two_factor_disabled``.
     """
 
     list_display = (
@@ -160,12 +166,34 @@ class TwoFactorDeviceAdmin(admin.ModelAdmin):
     # See OtpChallengeAdmin's comment above — this is what actually keeps secret_encrypted off
     # the rendered change form, not just out of readonly_fields.
     fields = readonly_fields
+    actions = ("force_disable_two_factor",)
 
     def get_queryset(self, request: HttpRequest) -> QuerySet[TwoFactorDevice]:
         return super().get_queryset(request).select_related("user")
 
     def has_add_permission(self, request: HttpRequest) -> bool:
         return False
+
+    def has_force_disable_2fa_permission(self, request: HttpRequest) -> bool:
+        return jwt_permissions.is_superuser(request.user)
+
+    @admin.action(
+        description=_("Force-disable 2FA for selected devices' users"),
+        permissions=["force_disable_2fa"],
+    )
+    def force_disable_two_factor(
+        self, request: HttpRequest, queryset: QuerySet[TwoFactorDevice]
+    ) -> None:
+        # Distinct users, not distinct rows: admin_force_disable already handles every method
+        # (totp, recovery_code) and every TrustedDevice for the user in one call — calling it
+        # once per selected TwoFactorDevice row (rather than once per user) would be redundant,
+        # not incorrect, but a user with two selected rows would otherwise fire the service twice.
+        seen_user_ids: set[Any] = set()
+        for device in queryset.select_related("user"):
+            if device.user_id in seen_user_ids:
+                continue
+            seen_user_ids.add(device.user_id)
+            TwoFactorService.admin_force_disable(device.user)
 
 
 @admin.register(RecoveryCode)
@@ -208,6 +236,13 @@ class LoginAttemptAdmin(admin.ModelAdmin):
     is the one deliberately plaintext, searchable field in this whole app (``docs/CONTRACT.md``
     §0 rail 4: not a secret by that rule's own definition, and an admin needs to search it) — do
     not "fix" this into a hash.
+
+    ``unlock_identifiers`` (Phase 8, ``docs/CONTRACT.md`` §11 item 18) lives HERE rather than on
+    the ``User`` admin: lockout state is an ``appkit.cache`` counter, not a model row, so this
+    action needs an identifier string to resolve it, and a selected ``LoginAttempt`` row already
+    carries the EXACT string ``LockoutService``'s cache key was built from — a ``User`` admin
+    action would have to re-derive one instead. Calls ``LockoutService.unlock`` once per distinct
+    ``identifier`` in the selection, never acting on a lock "object" that doesn't exist.
     """
 
     list_display = (
@@ -231,6 +266,7 @@ class LoginAttemptAdmin(admin.ModelAdmin):
         "failure_reason",
         "created_at",
     )
+    actions = ("unlock_identifiers",)
 
     def get_queryset(self, request: HttpRequest) -> QuerySet[LoginAttempt]:
         return super().get_queryset(request).select_related("user")
@@ -244,11 +280,20 @@ class LoginAttemptAdmin(admin.ModelAdmin):
     def has_delete_permission(self, request: HttpRequest, obj: Any = None) -> bool:
         return False
 
+    @admin.action(description=_("Unlock selected identifiers"))
+    def unlock_identifiers(self, request: HttpRequest, queryset: QuerySet[LoginAttempt]) -> None:
+        identifiers = set(queryset.values_list("identifier", flat=True))
+        for identifier in identifiers:
+            LockoutService.unlock(identifier)
+
 
 @admin.register(TrustedDevice)
 class TrustedDeviceAdmin(admin.ModelAdmin):
     """``token_hash`` is a secret (this repo's ``CLAUDE.md`` rule 4) — absent from every attribute
-    below.
+    below. ``revoke_trusted_devices`` never calls ``queryset.update()``: it loops the unrevoked
+    rows and calls ``TwoFactorService.revoke_trusted_device`` per row, the same
+    loop-and-call-the-service pattern ``AuthSessionAdmin.revoke_sessions`` uses (Phase 8,
+    ``docs/CONTRACT.md`` §11 item 18).
     """
 
     list_display = (
@@ -271,12 +316,20 @@ class TrustedDeviceAdmin(admin.ModelAdmin):
     # See OtpChallengeAdmin's comment above — this is what actually keeps token_hash off the
     # rendered change form, not just out of readonly_fields.
     fields = readonly_fields
+    actions = ("revoke_trusted_devices",)
 
     def get_queryset(self, request: HttpRequest) -> QuerySet[TrustedDevice]:
         return super().get_queryset(request).select_related("user")
 
     def has_add_permission(self, request: HttpRequest) -> bool:
         return False
+
+    @admin.action(description=_("Revoke selected trusted devices"))
+    def revoke_trusted_devices(
+        self, request: HttpRequest, queryset: QuerySet[TrustedDevice]
+    ) -> None:
+        for device in queryset.filter(revoked_at__isnull=True):
+            TwoFactorService.revoke_trusted_device(device)
 
 
 # Suggested Jazzmin icons (docs/CONTRACT.md §0 — this app never sets JAZZMIN_SETTINGS itself;
