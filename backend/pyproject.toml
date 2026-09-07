@@ -257,6 +257,16 @@ module = "jwt_multiauth.factories"
 disallow_untyped_calls = false
 disallow_any_generics = false
 
+# drf_spectacular.plumbing.OpenApiGeneratorExtension.__init_subclass__ (the base every
+# OpenApiAuthenticationExtension registration subclasses) carries no type annotations of its
+# own — strict's disallow_untyped_calls then flags the implicit call triggered by subclassing
+# it at all, not anything this module's own code does. Scoped to this one module, which exists
+# only to register JWTAuthentication's bearer scheme with drf-spectacular (Phase 6) — strict
+# stays on everywhere else.
+[[tool.mypy.overrides]]
+module = "jwt_multiauth.authentication"
+disallow_untyped_calls = false
+
 [tool.django-stubs]
 # tests/backend/settings.py doesn't exist until Phase 2 — mypy is not a Phase 1 verification
 # gate for exactly that reason (mirrors django-dynamic-user's own Phase 1). The setting is wired
@@ -269,6 +279,13 @@ DJANGO_SETTINGS_MODULE = "tests.backend.settings"
 pythonpath = ["src", ".."]
 testpaths = ["../tests/backend"]
 python_files = ["test_*.py"]
+# Phase 6 added backend/manage.py (needed only to run `manage.py spectacular`, never for the
+# test suite itself). pytest-django auto-detects a Django project by finding manage.py in the
+# rootdir and adds ITS directory to sys.path — which conflicts with the explicit `pythonpath`
+# above and breaks `import tests.backend.settings` (a package one level ABOVE backend/, not
+# inside it). Disabling auto-detection keeps pytest-django deferring entirely to the explicit
+# pythonpath/DJANGO_SETTINGS_MODULE options above, exactly as before manage.py existed.
+django_find_project = false
 # `-p appkit.testing` opts into appkit's shared appkit_api_client/appkit_user/appkit_admin_user/
 # appkit_auth_client/appkit_admin_client/appkit_frozen_request_id/appkit_clear_cache/
 # appkit_assert_error_envelope fixtures (appkit ships no pytest11 entry point deliberately, so

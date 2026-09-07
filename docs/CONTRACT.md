@@ -1472,6 +1472,58 @@ Everything not listed here is unchanged from
     `VerifiedContact` row — a real IDOR guard the `(challenge_id,)`-only form could not make; a
     mismatch is rejected with the same `ChallengeInvalid` every other rejection uses, never a
     distinguishable error.
+24. **Phase 6 decisions, made because §4/§5 as written left them unresolved — confirmed with the
+    user:**
+    - **`TwoFactorService.eligible_methods` (§4's frozen signature) ships in Phase 6, not Phase
+      7.** The shared login-response helper below needs it, and two of Phase 6's own mandated
+      tests (the pending_2fa shape, the 2FA-bootstrap carve-out's `required`-policy counterpart)
+      can't be written without it. `TwoFactorUnavailable` ships alongside it. The rest of
+      `TwoFactorService` (`enroll_totp`, `confirm_totp`, `disable`, `admin_force_disable`,
+      `generate_recovery_codes`, `verify_second_factor`) remains Phase 7's, per its own guide
+      prompt's "Finish TwoFactorService" phrasing — a partial class was always the expectation.
+      `eligible_methods` is deliberately policy-blind: it never reads `TWO_FACTOR["POLICY"]`,
+      only intersects `ALLOWED_METHODS` ∩ enrolled ∩ the different-channel filter, then adds
+      `"recovery_code"` back in LAST (after that filter, not before — the only ordering that
+      actually holds §11 item 14's "never alone" constraint against a different-channel drop
+      stripping the sole real method out from under it).
+    - **The login-response helper (`jwt_multiauth.login_flow.login_response`) is a new module,
+      not folded into `views_password.py`.** Used identically by `views_password.LoginView` and
+      `views_otp.OtpVerifyView`; a separate module avoids `views_otp.py` importing from
+      `views_password.py` backwards, and gives Phase 7's `TrustedDevice` cookie check
+      (checked before 2FA is even offered) one file to extend rather than two. It owns the
+      policy decision `eligible_methods` deliberately doesn't: `off` → tokens regardless;
+      `opt_in` → tokens when `eligible_methods` is empty, else pending_2fa; `required` → 401
+      `two_factor_unavailable` when empty, else pending_2fa; `staff_only` → same as `required`
+      but only when `getattr(user, "is_staff", False)`, else tokens. `created=True` (the
+      auto-provisioning carve-out) short-circuits straight to tokens before any of this runs,
+      checked first, never retroactively.
+    - **`GET /methods/` lives in a new `views_discovery.py`.** §5's table lists the endpoint but
+      names no owning module among the six §5 already enumerates by auth method, and none of
+      them fits an unauthenticated, method-agnostic discovery route.
+    - **`jwt_multiauth.authentication.JWTAuthentication` is a new module, not specified anywhere
+      above.** `/password/change/`'s `IsAuthenticated` requires SOME DRF authentication class
+      turning this app's own Bearer access token into `request.user`, and nothing before Phase 6
+      provided one. Declared explicitly via `authentication_classes` on every view that needs
+      it — including `LoginView`/`OtpVerifyView`, which are `AllowAny` and never read
+      `request.user`, but still need a registered authenticator so DRF's own
+      `APIView.handle_exception` has a `WWW-Authenticate` header to attach; without one, DRF
+      silently downgrades every `AuthenticationFailed` this app raises from `401` to `403`
+      (verified against a real request, not assumed from DRF's docs) — never via a host's
+      `DEFAULT_AUTHENTICATION_CLASSES`.
+    - **Three new `details.code` strings, coined here since §10 explicitly delegates the exact
+      mapping to `views_*.py`:** `invalid_credentials` (`/login/`'s unknown-identifier/
+      wrong-password path, `401`), `account_locked` (`/login/`'s lockout path, `401` —
+      deliberately distinguishable from `invalid_credentials`, since `LockoutService`'s own
+      counters are keyed on identifier+IP and audited for every identifier alike, real or not;
+      revealing "you tripped a rate limit" leaks nothing about whether the identifier itself
+      exists), and `channel_not_allowed` (`/otp/request/`'s not-in-`ALLOWED_AUTH_METHODS` path,
+      `400`). `two_factor_unavailable` and `otp_challenge_invalid` were already named above.
+    - **`/otp/verify/` performs no `LockoutService` check or `record_attempt` call.** §5's own
+      row names neither service for this endpoint, and the guide's Phase 6 prompt scopes lockout
+      to `/login/` only — followed as written. `LoginAttempt.method`'s `email_otp`/`phone_otp`
+      choices and `LockoutService.record_attempt`'s matching `_VALID_LOGIN_METHODS` entries exist
+      already, unused by this phase; left as a flagged gap for a future phase to decide, not
+      silently widened here.
 
 ---
 

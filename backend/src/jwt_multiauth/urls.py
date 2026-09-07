@@ -5,10 +5,41 @@ change/reset, OTP request/verify/resend, token refresh/verify, logout(-all), 2FA
 enroll/confirm/disable/recovery-regenerate, session and trusted-device list/revoke, contact
 verification. A host mounts this module under its own API namespace; ``urls_admin.py``
 (admin-only) is mounted separately, under a different namespace/permission tier entirely.
+
+No ``app_name`` here, and flat hyphenated url names (``jwt-multiauth-login``, not
+``jwt_multiauth:login``) — matching the only in-ecosystem precedent, ``dynamic_user.urls``'s own
+``name="dynamic-user-me"`` convention. Not specified anywhere in ``docs/CONTRACT.md``, which names
+no url at all — recorded as a deviation in its §11 register.
 """
 
 from __future__ import annotations
 
-from django.urls import URLPattern
+from django.urls import URLPattern, path
 
-urlpatterns: list[URLPattern] = []
+from jwt_multiauth.views_discovery import AuthMethodsView
+from jwt_multiauth.views_otp import OtpRequestView, OtpResendView, OtpVerifyView
+from jwt_multiauth.views_password import (
+    LoginView,
+    PasswordChangeView,
+    PasswordResetConfirmView,
+    PasswordResetRequestView,
+)
+
+urlpatterns: list[URLPattern] = [
+    path("login/", LoginView.as_view(), name="jwt-multiauth-login"),
+    path("password/change/", PasswordChangeView.as_view(), name="jwt-multiauth-password-change"),
+    path(
+        "password/reset/request/",
+        PasswordResetRequestView.as_view(),
+        name="jwt-multiauth-password-reset-request",
+    ),
+    path(
+        "password/reset/confirm/",
+        PasswordResetConfirmView.as_view(),
+        name="jwt-multiauth-password-reset-confirm",
+    ),
+    path("otp/request/", OtpRequestView.as_view(), name="jwt-multiauth-otp-request"),
+    path("otp/verify/", OtpVerifyView.as_view(), name="jwt-multiauth-otp-verify"),
+    path("otp/resend/", OtpResendView.as_view(), name="jwt-multiauth-otp-resend"),
+    path("methods/", AuthMethodsView.as_view(), name="jwt-multiauth-methods"),
+]
