@@ -44,6 +44,7 @@ from jwt_multiauth.models import (
     LoginAttempt,
     OtpChallenge,
     RecoveryCode,
+    TrustedDevice,
     TwoFactorDevice,
     VerifiedContact,
 )
@@ -57,6 +58,8 @@ from jwt_multiauth.signals import (
     phone_otp_requested,
     refresh_reuse_detected,
     session_revoked,
+    two_factor_disabled,
+    two_factor_enabled,
     user_logged_in,
     user_provisioned,
 )
@@ -100,6 +103,22 @@ class TokenPair:
     refresh: str
     session_id: str
     expires_at: datetime
+
+
+@dataclass(frozen=True)
+class TwoFactorTokenPair(TokenPair):
+    """``TwoFactorService.verify_second_factor``'s actual return value — a ``TokenPair`` (the
+    frozen ``-> TokenPair`` annotation stays literally true, Liskov-wise) plus the plaintext
+    trusted-device token, present only when the caller passed ``trust_device=True`` AND
+    ``TWO_FACTOR["TRUSTED_DEVICE"]["ENABLED"]``. Only the HASH is ever persisted (``TrustedDevice.
+    token_hash``); this is the one moment the raw cookie value exists anywhere outside the
+    client's own cookie jar. Not part of ``docs/CONTRACT.md``'s frozen dataclass list — a Phase 7
+    deviation recorded in its §11 register, chosen over widening ``TokenPair`` itself so
+    ``TokenService.issue_token_pair``/``rotate_refresh`` never carry a field that's meaningless
+    for them.
+    """
+
+    trusted_device_token: str | None = None
 
 
 class InvalidPendingToken(Exception):
@@ -333,13 +352,21 @@ class TokenService:
     ) -> str:
         """typ='pending_2fa', short TTL from TWO_FACTOR.PENDING_TOKEN_TTL_SECONDS. Carries
         primary_method as a claim so verify_second_factor can enforce the different-channel rule
-        without a second database round trip. request_meta is accepted per the frozen signature
-        but unread this phase — kept rather than dropped so a later phase can start reading it
-        without a signature change.
+        without a second database round trip. Phase 7 starts reading request_meta — accepted per
+        the frozen signature since Phase 6 but unread until now — embedding ip/user_agent/
+        device_label as claims (ip/ua/dl) so verify_second_factor can rebuild a RequestMeta for
+        TokenService.issue_token_pair without a request object of its own to read from (its own
+        frozen §4 signature takes no request_meta parameter — docs/CONTRACT.md §11 deviation).
         """
         ttl_seconds = conf.get_setting("TWO_FACTOR")["PENDING_TOKEN_TTL_SECONDS"]
         return tokens.issue(
-            {"sub": str(user.pk), "primary_method": primary_method},
+            {
+                "sub": str(user.pk),
+                "primary_method": primary_method,
+                "ip": _require(request_meta, "ip"),
+                "ua": request_meta.get("user_agent", "")[:512],
+                "dl": request_meta.get("device_label", "")[:255],
+            },
             typ=tokens.TYP_PENDING_2FA,
             ttl_seconds=ttl_seconds,
         )
@@ -1134,6 +1161,14 @@ class VerificationService:
         )
 
 
+@dataclass(frozen=True)
+class TotpEnrollment:
+    """``TwoFactorService.enroll_totp``'s return value — docs/CONTRACT.md §4, lines 541-544."""
+
+    secret: str  # plaintext — the ONE moment this is ever returned
+    otpauth_uri: str
+
+
 #: Maps a TWO_FACTOR["ALLOWED_METHODS"]/eligible-methods entry to the "channel" the
 #: different-channel rule compares it against — "password" is its own channel (2FA via email/
 #: phone is fully eligible after a password login); "recovery_code" has no channel of its own,
@@ -1144,13 +1179,64 @@ _METHOD_TO_CHANNEL: Final[dict[str, str]] = {
     "phone_otp": "phone",
 }
 
+#: The primary-login-method vocabulary ("password"/"email_otp"/"phone_otp", per
+#: TokenService.issue_pending_2fa_token's primary_method claim) mapped to the "channel" string
+#: eligible_methods()'s used_primary_channel parameter expects — the inverse direction of
+#: otp.method_for_channel, needed because the pending token carries a METHOD (docs/CONTRACT.md
+#: §11 item 24's primary_method claim), not a channel, and verify_second_factor must re-derive
+#: eligible_methods with the same used_primary_channel the original login-response helper used.
+_PRIMARY_METHOD_TO_CHANNEL: Final[dict[str, str]] = {
+    "password": "password",
+    "email_otp": "email",
+    "phone_otp": "phone",
+}
+
+#: Recovery-code count is generated with the same alphabet/length shape as a long, high-entropy
+#: OTP code — reusing otp.generate_code rather than inventing a second generator (this repo's
+#: CLAUDE.md rule 4: every generated code/token uses `secrets`, never `random` — otp.generate_code
+#: already does, via secrets.choice).
+_RECOVERY_CODE_LENGTH: Final[int] = 10
+
+
+def _totp_matched_step(totp: Any, code: str, *, valid_window: int, min_step: int) -> int | None:
+    """Returns the highest TOTP step/counter matching ``code`` within ``valid_window`` ticks of
+    now, or ``None`` if nothing matches OR the only match(es) are ``<= min_step`` (the replay
+    guard — a step already recorded as used, or an earlier one, is never accepted again).
+    ``pyotp.TOTP.verify`` alone can't implement this: it returns only a bool, never which offset
+    matched, so this loops the same window itself using ``pyotp.utils.strings_equal`` (the same
+    ``hmac.compare_digest``-based constant-time compare ``verify`` uses internally) — and
+    deliberately never breaks early on a match, so which offset in the window matched leaks
+    nothing via timing either.
+    """
+    from pyotp.utils import strings_equal
+
+    now = datetime.now()
+    current_step = totp.timecode(now)
+    matched: int | None = None
+    for offset in range(-valid_window, valid_window + 1):
+        step = current_step + offset
+        if step < 0:
+            continue
+        if (
+            strings_equal(str(code), totp.generate_otp(step))
+            and step > min_step
+            and (matched is None or step > matched)
+        ):
+            matched = step
+    return matched
+
 
 class TwoFactorService:
-    """Second-factor enrollment, eligibility, and verification — docs/CONTRACT.md §4, Phase 7.
-    Only ``eligible_methods`` ships in Phase 6, since the login-response helper
-    (``jwt_multiauth.login_flow``) needs it before any enrollment surface exists at all; the rest
-    of this class (``enroll_totp``, ``confirm_totp``, ``disable``, ``admin_force_disable``,
-    ``generate_recovery_codes``, ``verify_second_factor``) lands in Phase 7.
+    """Second-factor enrollment, eligibility, and verification — docs/CONTRACT.md §4.
+    ``eligible_methods`` shipped in Phase 6, since the login-response helper
+    (``jwt_multiauth.login_flow``) needed it before any enrollment surface existed at all; Phase 7
+    finishes the class: ``enroll_totp``, ``confirm_totp``, ``disable``, ``admin_force_disable``,
+    ``generate_recovery_codes``, ``verify_second_factor``.
+
+    ``pyotp`` is imported lazily, inside the TOTP-specific methods only — never at module scope —
+    so this module (and every non-TOTP method on this class) stays importable on the bare install
+    (``make test-bare``), the same discipline ``tasks.py`` applies to ``celery`` and ``checks.py``
+    to ``pyotp`` itself.
     """
 
     @staticmethod
@@ -1223,3 +1309,347 @@ class TwoFactorService:
             eligible.append("recovery_code")
 
         return eligible
+
+    @staticmethod
+    def resolve_pending(pending_token: str) -> tuple[Any, dict[str, Any], list[str]]:
+        """Resolves a ``pending_2fa`` token to ``(user, claims, eligible_methods)`` — shared by
+        ``verify_second_factor`` and ``views_twofactor.TwoFactorOtpRequestView`` (the
+        pending-token-gated ``/2fa/otp/request/`` step, a Phase 7 addition not in
+        ``docs/CONTRACT.md``'s frozen §4 list — recorded as a deviation in its §11 register, same
+        reasoning as adding ``TotpEnrollment``/``TwoFactorTokenPair``). Raises
+        ``InvalidPendingToken`` for a token that doesn't verify (signature/exp/typ) or whose
+        ``sub`` no longer resolves to a user. Does NOT check the pending token's consumed-jti
+        cache entry itself — only ``verify_second_factor`` consumes a pending token; a status/
+        request-OTP call reads it any number of times within its TTL.
+        """
+        claims = TokenService.verify_pending_2fa_token(pending_token)
+
+        user_model = get_user_model()
+        try:
+            user = user_model.objects.get(pk=claims["sub"])
+        except (user_model.DoesNotExist, ValueError, TypeError) as exc:
+            raise InvalidPendingToken("The pending token's user no longer resolves.") from exc
+
+        primary_method = claims["primary_method"]
+        used_primary_channel = _PRIMARY_METHOD_TO_CHANNEL.get(primary_method, primary_method)
+        eligible = TwoFactorService.eligible_methods(
+            user, used_primary_channel=used_primary_channel
+        )
+        return user, claims, eligible
+
+    @staticmethod
+    def enroll_totp(user: Any) -> TotpEnrollment:
+        """Generates a fresh secret (``pyotp.random_base32()``), encrypts it via
+        ``appkit.crypto.Cipher`` before it ever touches the database, and stores a
+        ``TwoFactorDevice`` row with ``confirmed_at=None``. Returns the PLAINTEXT secret and an
+        ``otpauth://`` URI — the only moment the plaintext secret is ever returned.
+
+        ``update_or_create``, not ``create``: ``UniqueConstraint(["user", "method"])`` means a
+        prior row — unconfirmed OR previously confirmed-then-disabled — already occupies the
+        ``(user, "totp")`` slot, and a fresh enrollment silently replaces it (resets
+        ``confirmed_at``/``disabled_at``/``last_used_step`` too, so a disabled device doesn't
+        stay disabled under a brand-new secret). Raises nothing under normal operation.
+        """
+        import pyotp
+        from appkit.crypto import Cipher
+
+        secret = pyotp.random_base32()
+        secret_encrypted = Cipher(keys.get_encryption_key()).encrypt(secret)
+
+        TwoFactorDevice.objects.update_or_create(
+            user=user,
+            method="totp",
+            defaults={
+                "secret_encrypted": secret_encrypted,
+                "confirmed_at": None,
+                "disabled_at": None,
+                "last_used_step": 0,
+            },
+        )
+
+        two_factor_conf = conf.get_setting("TWO_FACTOR")
+        user_fields = conf.get_setting("USER_FIELDS")
+        email_field = user_fields["EMAIL_FIELD"]
+        account_name = (
+            getattr(user, email_field, "") if email_field else ""
+        ) or user.get_username()
+        issuer = two_factor_conf["TOTP_ISSUER"] or None
+        otpauth_uri = pyotp.TOTP(secret).provisioning_uri(name=account_name, issuer_name=issuer)
+
+        return TotpEnrollment(secret=secret, otpauth_uri=otpauth_uri)
+
+    @staticmethod
+    def confirm_totp(user: Any, *, code: str) -> None:
+        """Raises ``django.core.exceptions.ValidationError`` if there is no pending (unconfirmed)
+        enrollment, if the device is already confirmed, or if ``code`` doesn't verify against the
+        decrypted secret within ``TWO_FACTOR["TOTP_DRIFT_WINDOW"]``. On success: sets
+        ``confirmed_at``, seeds ``last_used_step`` from the matched step (so the very next
+        ``verify_second_factor`` call can't replay this same confirmation code), fires
+        ``two_factor_enabled``.
+        """
+        import pyotp
+        from appkit.crypto import Cipher
+
+        try:
+            device = TwoFactorDevice.objects.get(user=user, method="totp")
+        except TwoFactorDevice.DoesNotExist as exc:
+            raise ValidationError(
+                "No pending TOTP enrollment to confirm.", code="no_pending_totp_enrollment"
+            ) from exc
+        if device.confirmed_at is not None:
+            raise ValidationError(
+                "This TOTP device is already confirmed.", code="totp_already_confirmed"
+            )
+
+        secret = Cipher(keys.get_encryption_key()).decrypt(device.secret_encrypted)
+        totp = pyotp.TOTP(secret)
+        drift_window = conf.get_setting("TWO_FACTOR")["TOTP_DRIFT_WINDOW"]
+        matched_step = _totp_matched_step(
+            totp, code, valid_window=drift_window, min_step=device.last_used_step
+        )
+        if matched_step is None:
+            raise ValidationError("Invalid TOTP code.", code="invalid_totp_code")
+
+        device.confirmed_at = timezone.now()
+        device.last_used_step = matched_step
+        device.save(update_fields=["confirmed_at", "last_used_step"])
+        two_factor_enabled.send(sender=TwoFactorDevice, user_id=user.pk, method="totp")
+
+    @staticmethod
+    def disable(user: Any, *, method: str) -> None:
+        """Caller must already have passed the view-layer re-auth step (password re-entry,
+        docs/CONTRACT.md §5). Raises ``ValidationError`` if no confirmed device/eligible
+        enrollment exists for ``method``. Fires ``two_factor_disabled`` on success.
+
+        ``"email_otp"``/``"phone_otp"`` have no enrollment record of their own — being enrolled
+        just means a ``VerifiedContact`` row matches the user's CURRENT field value (same
+        resolution rule ``eligible_methods`` uses) — so "disabling" one of these methods deletes
+        that ``VerifiedContact`` row: literal un-enrollment. Side effect, documented rather than
+        hidden: the contact then reads as unverified everywhere else too, including a future
+        verify-contact surface — not specified anywhere in ``docs/CONTRACT.md``, recorded as a
+        Phase 7 deviation in its §11 register.
+        """
+        if method == "totp":
+            updated = TwoFactorDevice.objects.filter(
+                user=user, method="totp", confirmed_at__isnull=False, disabled_at__isnull=True
+            ).update(disabled_at=timezone.now())
+            if not updated:
+                raise ValidationError(
+                    "No confirmed TOTP device to disable.", code="method_not_enrolled"
+                )
+        elif method == "recovery_code":
+            deleted, _ = RecoveryCode.objects.filter(user=user, used_at__isnull=True).delete()
+            if not deleted:
+                raise ValidationError(
+                    "No unused recovery codes to disable.", code="method_not_enrolled"
+                )
+        elif method in ("email_otp", "phone_otp"):
+            field = "email" if method == "email_otp" else "phone"
+            user_fields = conf.get_setting("USER_FIELDS")
+            field_name = user_fields["EMAIL_FIELD" if field == "email" else "PHONE_FIELD"]
+            value = getattr(user, field_name, "") if field_name else ""
+            deleted, _ = VerifiedContact.objects.filter(
+                user=user, field=field, value=value
+            ).delete()
+            if not deleted:
+                raise ValidationError(
+                    f"No verified {field} contact to disable.", code="method_not_enrolled"
+                )
+        else:
+            raise ValidationError(f"Unknown 2FA method {method!r}.", code="unknown_method")
+
+        two_factor_disabled.send(sender=TwoFactorDevice, user_id=user.pk, method=method)
+
+    @staticmethod
+    def admin_force_disable(user: Any) -> None:
+        """No re-auth requirement — the caller is a superuser acting on someone else's account,
+        not re-authenticating their own (view-layer, Phase 8, restricts this to an actual
+        ``is_superuser``, regardless of ``ADMIN_REQUIRES_SUPERUSER``). Disables every confirmed
+        TOTP device, deletes every unused recovery code, and revokes every live ``TrustedDevice``
+        for this user — a skip-2FA cookie must not outlive a force-disable (not specified in
+        ``docs/CONTRACT.md``, recorded as a Phase 7 deviation).
+
+        Deliberately does NOT delete ``VerifiedContact`` rows: contact verification is a separate
+        concern from 2FA with its own lifecycle (``VerificationService``), and a superuser
+        force-disabling 2FA is not expected to also strip a user's verified email/phone as a side
+        effect. A host whose only enrolled second factor is ``email_otp``/``phone_otp`` needs a
+        contact-verification-level action to fully remove that eligibility, not this one.
+
+        Fires ``two_factor_disabled`` once per method actually disabled; never raises — an admin
+        force-disabling an already-bare account is a no-op, not an error.
+        """
+        now = timezone.now()
+        totp_disabled = TwoFactorDevice.objects.filter(
+            user=user, method="totp", confirmed_at__isnull=False, disabled_at__isnull=True
+        ).update(disabled_at=now)
+        if totp_disabled:
+            two_factor_disabled.send(sender=TwoFactorDevice, user_id=user.pk, method="totp")
+
+        recovery_deleted, _ = RecoveryCode.objects.filter(user=user, used_at__isnull=True).delete()
+        if recovery_deleted:
+            two_factor_disabled.send(
+                sender=TwoFactorDevice, user_id=user.pk, method="recovery_code"
+            )
+
+        TrustedDevice.objects.filter(user=user, revoked_at__isnull=True).update(revoked_at=now)
+
+    @staticmethod
+    def generate_recovery_codes(user: Any) -> list[str]:
+        """Deletes any prior unused codes (never marks them used — a regenerated batch must not
+        leave stale live codes behind), generates ``TWO_FACTOR["RECOVERY_CODE_COUNT"]`` fresh
+        codes via ``otp.generate_code`` (``secrets``-backed, this repo's CLAUDE.md rule 4 — no
+        second generator invented for this), stores only their hashes. Returns the PLAINTEXT list
+        once — never retrievable again, same rule as the TOTP secret.
+        """
+        RecoveryCode.objects.filter(user=user, used_at__isnull=True).delete()
+
+        count = conf.get_setting("TWO_FACTOR")["RECOVERY_CODE_COUNT"]
+        pepper = keys.get_otp_pepper()
+        codes = [
+            otp.generate_code(
+                length=_RECOVERY_CODE_LENGTH,
+                alphabet="alphanumeric",
+                exclude_ambiguous=True,
+                case_sensitive=False,
+            )
+            for _ in range(count)
+        ]
+        RecoveryCode.objects.bulk_create(
+            RecoveryCode(user=user, code_hash=otp.hash_secret(code, pepper=pepper))
+            for code in codes
+        )
+        return codes
+
+    @staticmethod
+    def verify_second_factor(
+        pending_token: str,
+        *,
+        method: str,
+        code: str | None = None,
+        link_token: str | None = None,
+        challenge_id: str | None = None,
+        trust_device: bool = False,
+    ) -> TokenPair:
+        """Raises ``InvalidPendingToken`` if the pending token itself doesn't verify, is expired,
+        has the wrong ``typ``, or has already been consumed by a prior successful call (the
+        pending ``jti`` is cache-marked consumed only on success — a wrong code never burns the
+        token, so a user can retry). Re-derives ``eligible_methods`` for that same user/
+        ``primary_method`` and raises ``TwoFactorUnavailable`` if the requested ``method`` is not
+        in that FRESH set — this, not ``eligible_methods`` alone, is the actual enforcement point
+        for the different-channel rule; a client-supplied ``method`` is NEVER trusted blindly.
+
+        ``challenge_id`` is an additional keyword-only parameter beyond ``docs/CONTRACT.md`` §4's
+        frozen signature — required for ``"email_otp"``/``"phone_otp"``, since
+        ``OtpService.verify`` needs one and neither the frozen signature here nor ``/2fa/verify/``'s
+        frozen request body (§5) names one; a Phase 7 deviation recorded in §11, same reasoning as
+        item 23's addition of ``user`` to ``VerificationService.confirm``.
+
+        Verifies per-method: ``"totp"`` via ``pyotp`` against the decrypted device secret with a
+        replay guard (a matched step ``<= last_used_step`` is rejected; the new step is written
+        only on success). ``"email_otp"``/``"phone_otp"`` via ``OtpService.verify``, asserting the
+        returned ``purpose == "two_factor"`` and the resolved user matches (the same IDOR-guard
+        shape ``VerificationService.confirm`` uses) — ``otp_verified`` fires automatically from
+        inside ``OtpService.verify`` itself, so this method never fires it a second time.
+        ``"recovery_code"`` via a constant-time hash lookup iterating EVERY unused candidate
+        (never short-circuiting on the first match, so which position matched leaks nothing via
+        timing), marking the matched row ``used_at`` on success.
+
+        A wrong code/token for an otherwise-eligible method raises ``ChallengeInvalid`` — widened
+        here beyond its original ``OtpChallenge``-only scope (a Phase 7 deviation, §11) to cover a
+        wrong TOTP/recovery code too, since ``docs/CONTRACT.md`` §5's own ``/2fa/verify/`` row
+        lists only ``200``/``401`` as this endpoint's possible responses, never a ``400`` — the
+        view maps every one of these failures to the same ``401 otp_challenge_invalid`` shape,
+        never appkit's default ``400 validation_error`` mapping for a bare ``ChallengeInvalid``.
+
+        On success: if ``trust_device`` AND ``TWO_FACTOR["TRUSTED_DEVICE"]["ENABLED"]``, issues a
+        ``TrustedDevice`` row and returns its plaintext token on a ``TwoFactorTokenPair`` (only
+        the hash is ever persisted). Calls ``TokenService.issue_token_pair`` for the real tokens,
+        rebuilding a ``RequestMeta`` from the claims ``issue_pending_2fa_token`` embedded on the
+        pending token itself (this service method has no request object of its own to read from).
+        """
+        user, claims, eligible = TwoFactorService.resolve_pending(pending_token)
+
+        jti = claims["jti"]
+        consumed_key = build_cache_key("jwt_multiauth.pending2fa.consumed", jti)
+        if cache.get(consumed_key) is not None:
+            raise InvalidPendingToken("This pending 2FA token has already been consumed.")
+
+        primary_method = claims["primary_method"]
+        if method not in eligible:
+            raise TwoFactorUnavailable(
+                f"{method!r} is not an eligible second factor for this login."
+            )
+
+        if method == "totp":
+            try:
+                device = TwoFactorDevice.objects.get(
+                    user=user, method="totp", confirmed_at__isnull=False, disabled_at__isnull=True
+                )
+            except TwoFactorDevice.DoesNotExist as exc:
+                raise ChallengeInvalid("No confirmed TOTP device.") from exc
+
+            import pyotp
+            from appkit.crypto import Cipher
+
+            secret = Cipher(keys.get_encryption_key()).decrypt(device.secret_encrypted)
+            totp = pyotp.TOTP(secret)
+            drift_window = conf.get_setting("TWO_FACTOR")["TOTP_DRIFT_WINDOW"]
+            matched_step = _totp_matched_step(
+                totp, code or "", valid_window=drift_window, min_step=device.last_used_step
+            )
+            if matched_step is None:
+                raise ChallengeInvalid("Invalid or replayed TOTP code.")
+            device.last_used_step = matched_step
+            device.save(update_fields=["last_used_step"])
+        elif method in ("email_otp", "phone_otp"):
+            if not challenge_id:
+                raise ChallengeInvalid("challenge_id is required for this method.")
+            result = OtpService.verify(challenge_id, code=code, link_token=link_token)
+            if result.purpose != "two_factor" or result.created or result.user.pk != user.pk:
+                raise ChallengeInvalid(
+                    "OTP challenge is not a valid two_factor challenge for this user."
+                )
+        elif method == "recovery_code":
+            if not code:
+                raise ChallengeInvalid("A recovery code is required.")
+            pepper = keys.get_otp_pepper()
+            matched_code: RecoveryCode | None = None
+            for candidate in RecoveryCode.objects.filter(user=user, used_at__isnull=True):
+                if otp.verify_secret(code, candidate.code_hash, pepper=pepper):
+                    matched_code = candidate  # never break — constant-time across every candidate
+            if matched_code is None:
+                raise ChallengeInvalid("Invalid or already-used recovery code.")
+            matched_code.used_at = timezone.now()
+            matched_code.save(update_fields=["used_at"])
+        else:
+            raise TwoFactorUnavailable(f"Unknown 2FA method {method!r}.")
+
+        exp = claims["exp"]
+        remaining_ttl = max(int(exp - timezone.now().timestamp()), 1)
+        cache.set(consumed_key, True, timeout=remaining_ttl)
+
+        trusted_device_token: str | None = None
+        two_factor_conf = conf.get_setting("TWO_FACTOR")
+        if trust_device and two_factor_conf["TRUSTED_DEVICE"]["ENABLED"]:
+            trusted_device_token = secrets.token_urlsafe(32)
+            TrustedDevice.objects.create(
+                user=user,
+                token_hash=otp.hash_secret(trusted_device_token, pepper=keys.get_otp_pepper()),
+                expires_at=timezone.now()
+                + timedelta(seconds=two_factor_conf["TRUSTED_DEVICE"]["TTL_SECONDS"]),
+            )
+
+        request_meta: RequestMeta = {
+            "ip": claims["ip"],
+            "user_agent": claims.get("ua", ""),
+            "device_label": claims.get("dl", ""),
+            "method": primary_method,
+        }
+        pair = TokenService.issue_token_pair(user, request_meta=request_meta)
+        return TwoFactorTokenPair(
+            access=pair.access,
+            refresh=pair.refresh,
+            session_id=pair.session_id,
+            expires_at=pair.expires_at,
+            trusted_device_token=trusted_device_token,
+        )

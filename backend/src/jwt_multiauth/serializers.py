@@ -98,6 +98,81 @@ class AuthMethodsResponseSerializer(serializers.Serializer[Any]):
     two_factor = TwoFactorMethodsSerializer()
 
 
+#: The closed set of 2FA method strings — mirrors TWO_FACTOR["ALLOWED_METHODS"]'s own closed set
+#: (checks.py's E006), used wherever a request body names a specific method rather than merely
+#: listing eligible ones.
+_TWO_FACTOR_METHOD_CHOICES = ["totp", "email_otp", "phone_otp", "recovery_code"]
+
+
+class TwoFactorStatusResponseSerializer(serializers.Serializer[Any]):
+    """``GET /2fa/status/`` response — ``docs/CONTRACT.md`` §5."""
+
+    policy = serializers.CharField()
+    enrolled_methods = serializers.ListField(child=serializers.CharField())
+    eligible_methods = serializers.ListField(child=serializers.CharField())
+
+
+class TotpEnrollResponseSerializer(serializers.Serializer[Any]):
+    """``POST /2fa/totp/enroll/`` response. The ONE moment the plaintext secret is ever
+    returned — never present in any other response this app produces.
+    """
+
+    secret = serializers.CharField()
+    otpauth_uri = serializers.CharField()
+
+
+class TotpConfirmSerializer(serializers.Serializer[Any]):
+    code = serializers.CharField(write_only=True)
+
+
+class TwoFactorDisableSerializer(serializers.Serializer[Any]):
+    method = serializers.ChoiceField(choices=_TWO_FACTOR_METHOD_CHOICES)
+    password = serializers.CharField(trim_whitespace=False, write_only=True)
+
+
+class RecoveryCodesRegenerateSerializer(serializers.Serializer[Any]):
+    password = serializers.CharField(trim_whitespace=False, write_only=True)
+
+
+class RecoveryCodesResponseSerializer(serializers.Serializer[Any]):
+    """The PLAINTEXT recovery codes — returned once, the same rule as the TOTP secret."""
+
+    codes = serializers.ListField(child=serializers.CharField())
+
+
+class TwoFactorOtpRequestSerializer(serializers.Serializer[Any]):
+    """``POST /2fa/otp/request/`` — not in ``docs/CONTRACT.md``'s frozen §5 table, a Phase 7
+    addition recorded as a deviation in its §11 register: ``/2fa/verify/``'s frozen body has no
+    ``challenge_id`` of its own, and ``/otp/request/`` is hardcoded to ``purpose="login"``, so
+    ``email_otp``/``phone_otp`` as a SECOND factor needs its own request step, gated by the
+    pending token itself rather than an identifier (this endpoint never takes one).
+    """
+
+    pending_token = serializers.CharField()
+    method = serializers.ChoiceField(choices=["email_otp", "phone_otp"])
+
+
+class TwoFactorVerifySerializer(serializers.Serializer[Any]):
+    """``POST /2fa/verify/`` — ``docs/CONTRACT.md`` §5. Every method here needs exactly one of
+    ``code``/``link_token`` (``totp``/``recovery_code`` always via ``code``; ``email_otp``/
+    ``phone_otp`` via either, same magic-link-lives-here rule ``OtpVerifySerializer`` uses), so
+    the shared cross-field helper applies universally, not just to the OTP-based methods.
+    ``challenge_id`` is an addition beyond the frozen body (same §11 deviation as
+    ``TwoFactorOtpRequestSerializer`` above) — required only for ``"email_otp"``/``"phone_otp"``,
+    a method-conditional rule checked at the view layer rather than here.
+    """
+
+    pending_token = serializers.CharField()
+    method = serializers.ChoiceField(choices=_TWO_FACTOR_METHOD_CHOICES)
+    code = serializers.CharField(required=False, allow_blank=False, write_only=True)
+    link_token = serializers.CharField(required=False, allow_blank=False, write_only=True)
+    challenge_id = serializers.CharField(required=False, allow_blank=False)
+    trust_device = serializers.BooleanField(default=False)
+
+    def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
+        return _validate_exactly_one_of_code_or_link_token(attrs)
+
+
 def _validate_exactly_one_of_code_or_link_token(attrs: dict[str, Any]) -> dict[str, Any]:
     """Shared cross-field rule for every serializer accepting ``code? or link_token?``
     (``docs/CONTRACT.md`` §5: "exactly one required, magic-link lives here, not a separate

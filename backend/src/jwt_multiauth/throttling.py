@@ -30,6 +30,11 @@ TOKEN_REFRESH = "jwt_multiauth_token_refresh"  # noqa: S105 -- a throttle scope,
 TOKEN_VERIFY = "jwt_multiauth_token_verify"  # noqa: S105 -- see above
 LOGOUT = "jwt_multiauth_logout"
 LOGOUT_ALL = "jwt_multiauth_logout_all"
+#: Phase 7 addition, not present when this module's other 2FA scopes were first declared — a
+#: purpose="two_factor" OTP challenge needs its own request step, mirroring OTP_REQUEST/OTP_VERIFY
+#: above, since /2fa/verify/'s frozen body carries no challenge_id of its own (docs/CONTRACT.md
+#: §11 deviations register).
+TWO_FACTOR_OTP_REQUEST = "jwt_multiauth_2fa_otp_request"
 TWO_FACTOR_STATUS = "jwt_multiauth_2fa_status"
 TWO_FACTOR_TOTP_ENROLL = "jwt_multiauth_2fa_totp_enroll"
 TWO_FACTOR_TOTP_CONFIRM = "jwt_multiauth_2fa_totp_confirm"

@@ -938,6 +938,7 @@ later phase implements `POLICY`, not `ENABLED`; there is no `ENABLED` key in thi
 | `TWO_FACTOR.PENDING_TOKEN_TTL_SECONDS` | `300` | Pending-2FA token lifetime |
 | `TWO_FACTOR.RECOVERY_CODE_COUNT` | `10` | Codes generated per `generate_recovery_codes` call |
 | `TWO_FACTOR.TOTP_DRIFT_WINDOW` | `1` | `pyotp` step-drift tolerance |
+| `TWO_FACTOR.TOTP_ISSUER` | `""` | Issuer name embedded in the `otpauth://` URI's `issuer_name` — empty means `provisioning_uri` is called without one. A Phase 7 addition, §11 register |
 | `TWO_FACTOR.TRUSTED_DEVICE.ENABLED` | `False` | Master on/off for the skip-2FA cookie (§11 item 3 — nested here, not a new top-level sub-dict) |
 | `TWO_FACTOR.TRUSTED_DEVICE.TTL_SECONDS` | `2592000` | Trusted-device cookie/row lifetime |
 | `TWO_FACTOR.TRUSTED_DEVICE.COOKIE_NAME` | `"jwt_multiauth_td"` | Cookie name |
@@ -1524,6 +1525,65 @@ Everything not listed here is unchanged from
       choices and `LockoutService.record_attempt`'s matching `_VALID_LOGIN_METHODS` entries exist
       already, unused by this phase; left as a flagged gap for a future phase to decide, not
       silently widened here.
+25. **Phase 7 decisions, made because §4/§5 as written left them unresolved — confirmed with the
+    user:**
+    - **`TwoFactorTokenPair(TokenPair)`, a new frozen dataclass** — `verify_second_factor`'s
+      frozen `-> TokenPair` return type stays literally true (Liskov), while the plaintext
+      trusted-device token (only its hash is ever persisted) still reaches the view via a
+      `trusted_device_token: str | None = None` field, rather than widening `TokenPair` itself
+      with a field meaningless to `TokenService.issue_token_pair`/`.rotate_refresh`.
+    - **`TotpEnrollment`, `TwoFactorService.resolve_pending`** — the former is §4's own frozen
+      dataclass (lines 541-544), now actually implemented; the latter is a NEW, non-frozen helper
+      (`pending_token -> (user, claims, eligible_methods)`) factoring out the resolve-and-
+      re-derive prefix shared by `verify_second_factor` and the new `/2fa/otp/request/` endpoint
+      below — adding a method is not the renaming/removal §12 treats as breaking.
+    - **`issue_pending_2fa_token` starts reading `request_meta`** (accepted-but-unread since
+      Phase 6), embedding `ip`/`ua` (truncated 512)/`dl` (truncated 255) as token claims.
+      `verify_second_factor` has no frozen `request_meta` parameter of its own and no request
+      object to read one from, so it rebuilds a `RequestMeta` from these claims to call
+      `TokenService.issue_token_pair`. Neither frozen signature's shape changed.
+    - **`verify_second_factor` gains a keyword-only `challenge_id: str | None = None`** beyond
+      §4's frozen signature — same reasoning as item 23's addition of `user` to
+      `VerificationService.confirm`. `OtpService.verify` needs a `challenge_id` for the
+      `email_otp`/`phone_otp` second-factor path, and neither §4's frozen signature nor §5's
+      frozen `/2fa/verify/` request body names one.
+    - **New `POST /2fa/otp/request/` endpoint, not in §5's frozen table.** `/2fa/verify/`'s body
+      has no `challenge_id` (previous item) and `/otp/request/` (Phase 6) is hardcoded to
+      `purpose="login"` with no pending-token gate — neither can produce the
+      `purpose="two_factor"` challenge `email_otp`/`phone_otp` as a SECOND factor needs. Body
+      `{pending_token, method}`, gated by the pending token (no decoy path — the caller already
+      proved a primary factor to obtain it); resolves the destination off the user's current
+      `EMAIL_FIELD`/`PHONE_FIELD` value and delegates to `OtpService.request(..., purpose=
+      "two_factor")`. New throttle scope `jwt_multiauth_2fa_otp_request`, not among the ones
+      `throttling.py` pre-declared alongside the rest of Phase 7's scopes.
+    - **`/2fa/verify/` returns only `200`/`401`, never `400`, matching §5's own row literally.**
+      `ChallengeInvalid` is widened beyond its original `OtpChallenge`-only scope to also cover a
+      wrong TOTP code or a wrong/already-used recovery code (previously raised only by
+      `OtpService.verify`/`.resend`) — `TwoFactorVerifyView` maps every one of
+      `InvalidPendingToken`/`TwoFactorUnavailable`/`ChallengeInvalid` to `401`, unlike
+      `OtpVerifyView`'s `400` mapping for the same `ChallengeInvalid` exception at `/otp/verify/`.
+    - **`disable(user, method="email_otp"/"phone_otp")` deletes the matching `VerifiedContact`
+      row(s)** — these methods have no enrollment record of their own (being enrolled just means
+      a `VerifiedContact` matches the user's current field value, `eligible_methods`'s own
+      resolution rule), so un-enrolling them un-verifies the contact, full stop — a side effect
+      that also affects a future verify-contact surface, documented rather than hidden.
+    - **`admin_force_disable` disables TOTP, deletes unused recovery codes, and revokes every
+      live `TrustedDevice` — but deliberately does NOT delete `VerifiedContact` rows.** Contact
+      verification is a separate concern with its own lifecycle; a superuser force-disabling 2FA
+      is not expected to also strip a user's verified email/phone as a side effect. Limitation,
+      stated plainly: a host whose only enrolled second factor is `email_otp`/`phone_otp` is not
+      fully de-2FA'd by this call alone.
+    - **Pending-token replay is closed.** A successful `verify_second_factor` cache-marks the
+      token's `jti` consumed (`django.core.cache`, TTL = the token's own remaining lifetime) —
+      `InvalidPendingToken`'s pre-existing docstring already claimed to cover "already-consumed";
+      this phase is what makes that true. A wrong code never consumes the token — only a
+      successful verification does, so a user can retry with the correct code.
+    - **New `TWO_FACTOR.TOTP_ISSUER` setting, default `""`.** No key existed for the `otpauth://`
+      URI's issuer name; empty means `provisioning_uri` is called without `issuer_name` at all.
+    - **`/2fa/disable/`/`/2fa/recovery-codes/regenerate/`'s re-auth is password re-entry** — §5
+      already decided this ("since it's available regardless of which method is being
+      disabled"); the guide's own Phase 7 prompt's "password OR current 2FA code, decide and
+      document which" is superseded by that earlier decision, not re-opened here.
 
 ---
 

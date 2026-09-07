@@ -156,6 +156,7 @@ class OtpVerifyView(generics.GenericAPIView[Any]):
         }
         return login_response(
             result.user,
+            request=request,
             request_meta=request_meta,
             remember_me=False,
             created=result.created,

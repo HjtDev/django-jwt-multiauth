@@ -12,16 +12,20 @@ from __future__ import annotations
 
 from typing import Any
 
+from django.utils import timezone
 from rest_framework.exceptions import AuthenticationFailed
+from rest_framework.request import Request
 from rest_framework.response import Response
 
-from jwt_multiauth import conf
+from jwt_multiauth import conf, keys, otp
+from jwt_multiauth.models import TrustedDevice
 from jwt_multiauth.services import RequestMeta, TokenService, TwoFactorService
 
 
 def login_response(
     user: Any,
     *,
+    request: Request,
     request_meta: RequestMeta,
     remember_me: bool,
     created: bool,
@@ -32,6 +36,11 @@ def login_response(
     ``/otp/verify/`` rows) for an already-authenticated ``user``.
 
     Args:
+        request: the raw DRF request — read ONLY for its trusted-device cookie (§10's one
+            documented, revocable bypass of "no token before 2FA"). Added in Phase 7; both
+            existing call sites (``views_password.LoginView``, ``views_otp.OtpVerifyView``)
+            already have a ``request`` in hand, so this is a pure addition, not a signature
+            change either call site struggled to satisfy.
         request_meta: passed straight through to ``TokenService``.
         remember_me: extends the issued refresh token's TTL — ignored entirely when tokens
             aren't issued (the pending_2fa branch has no refresh token yet).
@@ -39,8 +48,9 @@ def login_response(
             ``user`` (``OtpVerifyResult.created``) — ``False`` unconditionally from
             ``views_password.LoginView``, since password never auto-provisions
             (``docs/CONTRACT.md`` §11 item 19). ``True`` short-circuits straight to issuing real
-            tokens, skipping the 2FA check entirely — the §10 2FA-bootstrap carve-out: a user
-            provisioned in this same request has no enrolled factor to be unavailable FOR.
+            tokens, skipping the 2FA check (and the trusted-device check) entirely — the §10
+            2FA-bootstrap carve-out: a user provisioned in this same request has no enrolled
+            factor to be unavailable FOR, and no trusted-device cookie of their own yet either.
         used_primary_channel: ``"password"``, ``"email"``, or ``"phone"`` — what the
             different-channel rule compares a candidate second factor's channel against.
         primary_method: ``"password"``, ``"email_otp"``, or ``"phone_otp"`` — passed to
@@ -53,7 +63,16 @@ def login_response(
             in this case (this repo's ``CLAUDE.md`` rule 3).
     """
     if not created:
-        policy = conf.get_setting("TWO_FACTOR")["POLICY"]
+        two_factor_conf = conf.get_setting("TWO_FACTOR")
+        trusted_device_conf = two_factor_conf["TRUSTED_DEVICE"]
+        if trusted_device_conf["ENABLED"] and _trusted_device_skips_2fa(
+            user, request, cookie_name=trusted_device_conf["COOKIE_NAME"]
+        ):
+            return tokens_response(
+                user, request_meta=request_meta, remember_me=remember_me, created=created
+            )
+
+        policy = two_factor_conf["POLICY"]
         if policy != "off":
             eligible = TwoFactorService.eligible_methods(
                 user, used_primary_channel=used_primary_channel
@@ -70,15 +89,61 @@ def login_response(
             if two_factor_required:
                 raise AuthenticationFailed({"code": "two_factor_unavailable"})
 
-    return _tokens_response(
+    return tokens_response(
         user, request_meta=request_meta, remember_me=remember_me, created=created
     )
 
 
-def _tokens_response(
+def _trusted_device_skips_2fa(user: Any, request: Request, *, cookie_name: str) -> bool:
+    """Checked BEFORE 2FA is even offered (``docs/CONTRACT.md`` §10's one documented, revocable
+    bypass of "no token before 2FA"): does ``request`` carry ``cookie_name`` matching one of
+    THIS user's own live (unrevoked, unexpired) ``TrustedDevice`` rows? A missing, foreign,
+    stale, or revoked cookie is simply ignored, never an error — this app never lets an invalid
+    trusted-device cookie downgrade or block an otherwise-normal login. Bumps ``last_used_at`` on
+    a match (``TrustedDevice.last_used_at`` is ``auto_now_add=True`` — only an explicit save on
+    use actually advances it, per the model's own docstring).
+    """
+    raw_token = request.COOKIES.get(cookie_name)
+    if not raw_token:
+        return False
+
+    token_hash = otp.hash_secret(raw_token, pepper=keys.get_otp_pepper())
+    try:
+        device = TrustedDevice.objects.get(
+            user=user, token_hash=token_hash, revoked_at__isnull=True
+        )
+    except TrustedDevice.DoesNotExist:
+        return False
+
+    if device.expires_at <= timezone.now():
+        return False
+
+    device.last_used_at = timezone.now()
+    device.save(update_fields=["last_used_at"])
+    return True
+
+
+def tokens_response(
     user: Any, *, request_meta: RequestMeta, remember_me: bool, created: bool
 ) -> Response:
+    """Issues a BRAND-NEW token pair for ``user`` and builds the HTTP response for it. The
+    ordinary login-success tail — every call site here has a ``user`` but no pair yet.
+    """
     pair = TokenService.issue_token_pair(user, request_meta=request_meta, remember_me=remember_me)
+    return pair_response(pair, remember_me=remember_me, created=created)
+
+
+def pair_response(pair: Any, *, remember_me: bool, created: bool) -> Response:
+    """Builds the HTTP response (body + refresh cookie, per ``REFRESH_COOKIE["TRANSPORT"]``) for
+    an ALREADY-ISSUED token pair — the shared tail of :func:`tokens_response` (a brand-new pair,
+    above) and ``views_twofactor.TwoFactorVerifyView`` (a pair
+    ``TwoFactorService.verify_second_factor`` already issued internally; calling
+    :func:`tokens_response` there would mint a SECOND, redundant session for the same login).
+
+    Also sets the trusted-device cookie when ``pair`` carries one
+    (``services.TwoFactorTokenPair.trusted_device_token``) — read via ``getattr`` so this
+    function stays agnostic of that subclass and needs no import of it.
+    """
     body: dict[str, Any] = {
         "access": pair.access,
         "session_id": pair.session_id,
@@ -88,22 +153,36 @@ def _tokens_response(
     cookie_conf = conf.get_setting("REFRESH_COOKIE")
     if cookie_conf["TRANSPORT"] == "body":
         body["refresh"] = pair.refresh
-        return Response(body)
+        response = Response(body)
+    else:
+        tokens_conf = conf.get_setting("TOKENS")
+        max_age = (
+            tokens_conf["REMEMBER_ME_TTL_SECONDS"]
+            if remember_me
+            else tokens_conf["REFRESH_TTL_SECONDS"]
+        )
+        response = Response(body)
+        response.set_cookie(
+            cookie_conf["NAME"],
+            pair.refresh,
+            max_age=max_age,
+            httponly=True,
+            secure=cookie_conf["SECURE"],
+            samesite=cookie_conf["SAMESITE"],
+            path="/",
+        )
 
-    tokens_conf = conf.get_setting("TOKENS")
-    max_age = (
-        tokens_conf["REMEMBER_ME_TTL_SECONDS"]
-        if remember_me
-        else tokens_conf["REFRESH_TTL_SECONDS"]
-    )
-    response = Response(body)
-    response.set_cookie(
-        cookie_conf["NAME"],
-        pair.refresh,
-        max_age=max_age,
-        httponly=True,
-        secure=cookie_conf["SECURE"],
-        samesite=cookie_conf["SAMESITE"],
-        path="/",
-    )
+    trusted_device_token = getattr(pair, "trusted_device_token", None)
+    if trusted_device_token:
+        trusted_device_conf = conf.get_setting("TWO_FACTOR")["TRUSTED_DEVICE"]
+        response.set_cookie(
+            trusted_device_conf["COOKIE_NAME"],
+            trusted_device_token,
+            max_age=trusted_device_conf["TTL_SECONDS"],
+            httponly=True,
+            secure=cookie_conf["SECURE"],
+            samesite=cookie_conf["SAMESITE"],
+            path="/",
+        )
+
     return response

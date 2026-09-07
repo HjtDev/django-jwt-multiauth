@@ -128,6 +128,7 @@ class LoginView(generics.GenericAPIView[Any]):
         }
         return login_response(
             user,
+            request=request,
             request_meta=request_meta,
             remember_me=remember_me,
             created=False,

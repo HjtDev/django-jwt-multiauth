@@ -24,6 +24,15 @@ from jwt_multiauth.views_password import (
     PasswordResetConfirmView,
     PasswordResetRequestView,
 )
+from jwt_multiauth.views_twofactor import (
+    RecoveryCodesRegenerateView,
+    TotpConfirmView,
+    TotpEnrollView,
+    TwoFactorDisableView,
+    TwoFactorOtpRequestView,
+    TwoFactorStatusView,
+    TwoFactorVerifyView,
+)
 
 urlpatterns: list[URLPattern] = [
     path("login/", LoginView.as_view(), name="jwt-multiauth-login"),
@@ -42,4 +51,19 @@ urlpatterns: list[URLPattern] = [
     path("otp/verify/", OtpVerifyView.as_view(), name="jwt-multiauth-otp-verify"),
     path("otp/resend/", OtpResendView.as_view(), name="jwt-multiauth-otp-resend"),
     path("methods/", AuthMethodsView.as_view(), name="jwt-multiauth-methods"),
+    path("2fa/status/", TwoFactorStatusView.as_view(), name="jwt-multiauth-2fa-status"),
+    path("2fa/totp/enroll/", TotpEnrollView.as_view(), name="jwt-multiauth-2fa-totp-enroll"),
+    path("2fa/totp/confirm/", TotpConfirmView.as_view(), name="jwt-multiauth-2fa-totp-confirm"),
+    path("2fa/disable/", TwoFactorDisableView.as_view(), name="jwt-multiauth-2fa-disable"),
+    path(
+        "2fa/recovery-codes/regenerate/",
+        RecoveryCodesRegenerateView.as_view(),
+        name="jwt-multiauth-2fa-recovery-codes-regenerate",
+    ),
+    path(
+        "2fa/otp/request/",
+        TwoFactorOtpRequestView.as_view(),
+        name="jwt-multiauth-2fa-otp-request",
+    ),
+    path("2fa/verify/", TwoFactorVerifyView.as_view(), name="jwt-multiauth-2fa-verify"),
 ]

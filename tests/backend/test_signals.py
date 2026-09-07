@@ -2,13 +2,18 @@
 shape exactly — the payload key SET, not just individual values, so a stray extra kwarg fails.
 ``contact_verified``, ``login_failed``, ``account_locked``, ``password_changed`` are already
 emitted by real Phase 5 service calls, exercised here via a real call (not a bare ``.send()``).
-``user_logged_out`` (Phase 6), ``two_factor_enabled``/``two_factor_disabled`` (Phase 7) have no
-emitting code yet — proven here only as a documentation-matching contract check: connecting a
-receiver and sending the exact documented payload shape round-trips cleanly.
+``user_logged_out`` (Phase 6) has no emitting code yet — proven here only as a documentation-
+matching contract check: connecting a receiver and sending the exact documented payload shape
+round-trips cleanly. ``two_factor_enabled``/``two_factor_disabled`` (Phase 7) now ARE emitted by
+real service calls — ``TwoFactorService.confirm_totp``/``.disable``/``.admin_force_disable`` —
+exercised here the same way ``password_changed`` is, not via a bare ``.send()`` placeholder.
 
 ``phone_otp_requested``/``email_otp_requested``/``otp_verified``/``user_provisioned`` (Phase 4) and
 ``user_logged_in``/``refresh_reuse_detected``/``session_revoked`` (Phase 3) already have per-value
 coverage in ``test_otp_service.py``/``test_token_service.py`` — not duplicated here.
+``otp_verified`` firing for an ``email_otp``/``phone_otp`` SECOND factor, and NOT firing for
+``totp``/``recovery_code`` (which have no ``OtpChallenge`` involved), is proven in
+``test_two_factor_verify.py`` instead, alongside the rest of ``verify_second_factor``'s round trip.
 """
 
 from __future__ import annotations
@@ -19,11 +24,12 @@ from django.test import override_settings
 from django.utils import timezone
 
 from jwt_multiauth.factories import UserFactory
-from jwt_multiauth.models import LoginAttempt, VerifiedContact
+from jwt_multiauth.models import LoginAttempt, TwoFactorDevice, VerifiedContact
 from jwt_multiauth.services import (
     LockoutService,
     PasswordService,
     TokenService,
+    TwoFactorService,
     VerificationService,
 )
 from jwt_multiauth.signals import (
@@ -140,33 +146,63 @@ def test_user_logged_out_contract_shape() -> None:
     ]
 
 
-def test_two_factor_enabled_contract_shape() -> None:
-    received: list[dict[str, object]] = []
-
-    def receiver(**kwargs: object) -> None:
-        kwargs.pop("signal", None)
-        received.append(kwargs)
-
-    two_factor_enabled.connect(receiver, weak=False)
-    try:
-        two_factor_enabled.send(sender=object, user_id=1, method="totp")
-    finally:
-        two_factor_enabled.disconnect(receiver)
-
-    assert received == [{"sender": object, "user_id": 1, "method": "totp"}]
+# -------------------------------------------------------------- two-factor signals (real calls)
 
 
-def test_two_factor_disabled_contract_shape() -> None:
-    received: list[dict[str, object]] = []
+@pytest.mark.requires_extra
+def test_two_factor_enabled_payload_matches_contract_exactly() -> None:
+    import pyotp  # deferred — a module-scope import would crash bare-install collection
 
-    def receiver(**kwargs: object) -> None:
-        kwargs.pop("signal", None)
-        received.append(kwargs)
+    user = UserFactory()
+    enrollment = TwoFactorService.enroll_totp(user)
+    code = pyotp.TOTP(enrollment.secret).now()
 
-    two_factor_disabled.connect(receiver, weak=False)
-    try:
-        two_factor_disabled.send(sender=object, user_id=1, method="totp")
-    finally:
-        two_factor_disabled.disconnect(receiver)
+    with captured(two_factor_enabled) as payloads:
+        TwoFactorService.confirm_totp(user, code=code)
 
-    assert received == [{"sender": object, "user_id": 1, "method": "totp"}]
+    assert len(payloads) == 1
+    payload = payloads[0]
+    assert set(payload) == {"sender", "user_id", "method"}
+    assert payload["sender"] is TwoFactorDevice
+    assert payload["user_id"] == user.pk
+    assert payload["method"] == "totp"
+
+
+@pytest.mark.requires_extra
+def test_two_factor_disabled_payload_matches_contract_exactly_via_disable() -> None:
+    import pyotp  # deferred — a module-scope import would crash bare-install collection
+
+    user = UserFactory()
+    user.set_password("correct-horse-battery-staple-9")
+    user.save()
+    enrollment = TwoFactorService.enroll_totp(user)
+    TwoFactorService.confirm_totp(user, code=pyotp.TOTP(enrollment.secret).now())
+
+    with captured(two_factor_disabled) as payloads:
+        TwoFactorService.disable(user, method="totp")
+
+    assert len(payloads) == 1
+    payload = payloads[0]
+    assert set(payload) == {"sender", "user_id", "method"}
+    assert payload["sender"] is TwoFactorDevice
+    assert payload["user_id"] == user.pk
+    assert payload["method"] == "totp"
+
+
+@pytest.mark.requires_extra
+def test_two_factor_disabled_payload_matches_contract_exactly_via_admin_force_disable() -> None:
+    import pyotp  # deferred — a module-scope import would crash bare-install collection
+
+    user = UserFactory()
+    enrollment = TwoFactorService.enroll_totp(user)
+    TwoFactorService.confirm_totp(user, code=pyotp.TOTP(enrollment.secret).now())
+
+    with captured(two_factor_disabled) as payloads:
+        TwoFactorService.admin_force_disable(user)
+
+    assert len(payloads) == 1
+    payload = payloads[0]
+    assert set(payload) == {"sender", "user_id", "method"}
+    assert payload["sender"] is TwoFactorDevice
+    assert payload["user_id"] == user.pk
+    assert payload["method"] == "totp"
