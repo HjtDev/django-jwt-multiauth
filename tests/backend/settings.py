@@ -139,6 +139,11 @@ SPECTACULAR_SETTINGS = {
     "ENUM_NAME_OVERRIDES": {
         "TwoFactorMethodEnum": ["totp", "email_otp", "phone_otp", "recovery_code"],
         "TwoFactorOtpRequestMethodEnum": ["email_otp", "phone_otp"],
+        # Phase 8: OtpRequestSerializer.channel and VerifyContactRequestSerializer.field share
+        # the identical ["email", "phone"] choice set under two different field names —
+        # drf-spectacular's own collision-naming warning ("multiple names for the same choice
+        # set"), pinned to one explicit name rather than left to its non-deterministic fallback.
+        "OtpChannelEnum": ["email", "phone"],
     },
 }
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from django.urls import URLPattern, path
 
+from jwt_multiauth.views_account import VerifyContactConfirmView, VerifyContactRequestView
 from jwt_multiauth.views_discovery import AuthMethodsView
 from jwt_multiauth.views_otp import OtpRequestView, OtpResendView, OtpVerifyView
 from jwt_multiauth.views_password import (
@@ -24,6 +25,13 @@ from jwt_multiauth.views_password import (
     PasswordResetConfirmView,
     PasswordResetRequestView,
 )
+from jwt_multiauth.views_session import (
+    SessionListView,
+    SessionRevokeView,
+    TrustedDeviceListView,
+    TrustedDeviceRevokeView,
+)
+from jwt_multiauth.views_token import LogoutAllView, LogoutView, TokenRefreshView, TokenVerifyView
 from jwt_multiauth.views_twofactor import (
     RecoveryCodesRegenerateView,
     TotpConfirmView,
@@ -66,4 +74,30 @@ urlpatterns: list[URLPattern] = [
         name="jwt-multiauth-2fa-otp-request",
     ),
     path("2fa/verify/", TwoFactorVerifyView.as_view(), name="jwt-multiauth-2fa-verify"),
+    path("token/refresh/", TokenRefreshView.as_view(), name="jwt-multiauth-token-refresh"),
+    path("token/verify/", TokenVerifyView.as_view(), name="jwt-multiauth-token-verify"),
+    path("logout/", LogoutView.as_view(), name="jwt-multiauth-logout"),
+    path("logout/all/", LogoutAllView.as_view(), name="jwt-multiauth-logout-all"),
+    path("sessions/", SessionListView.as_view(), name="jwt-multiauth-sessions"),
+    path("sessions/<uuid:pk>/", SessionRevokeView.as_view(), name="jwt-multiauth-sessions-revoke"),
+    path(
+        "trusted-devices/",
+        TrustedDeviceListView.as_view(),
+        name="jwt-multiauth-trusted-devices",
+    ),
+    path(
+        "trusted-devices/<int:pk>/",
+        TrustedDeviceRevokeView.as_view(),
+        name="jwt-multiauth-trusted-devices-revoke",
+    ),
+    path(
+        "account/verify-contact/request/",
+        VerifyContactRequestView.as_view(),
+        name="jwt-multiauth-verify-contact-request",
+    ),
+    path(
+        "account/verify-contact/confirm/",
+        VerifyContactConfirmView.as_view(),
+        name="jwt-multiauth-verify-contact-confirm",
+    ),
 ]

@@ -35,7 +35,6 @@ from rest_framework.throttling import ScopedRateThrottle
 from jwt_multiauth import conf, throttling
 from jwt_multiauth.authentication import JWTAuthentication
 from jwt_multiauth.login_flow import pair_response
-from jwt_multiauth.models import RecoveryCode, TwoFactorDevice, VerifiedContact
 from jwt_multiauth.serializers import (
     RecoveryCodesRegenerateSerializer,
     RecoveryCodesResponseSerializer,
@@ -96,24 +95,8 @@ class TwoFactorStatusView(generics.GenericAPIView[Any]):
         # `User | AnonymousUser` type is stricter than a raw FK filter's stub expects, the same
         # mismatch every service method sidesteps by never typing `user` as the concrete model.
         user: Any = request.user
-        user_fields = conf.get_setting("USER_FIELDS")
 
-        enrolled: list[str] = []
-        if TwoFactorDevice.objects.filter(
-            user=user, method="totp", confirmed_at__isnull=False, disabled_at__isnull=True
-        ).exists():
-            enrolled.append("totp")
-        for method, field in (("email_otp", "email"), ("phone_otp", "phone")):
-            field_name = user_fields["EMAIL_FIELD" if field == "email" else "PHONE_FIELD"]
-            value = getattr(user, field_name, "") if field_name else ""
-            if (
-                value
-                and VerifiedContact.objects.filter(user=user, field=field, value=value).exists()
-            ):
-                enrolled.append(method)
-        if RecoveryCode.objects.filter(user=user, used_at__isnull=True).exists():
-            enrolled.append("recovery_code")
-
+        enrolled = TwoFactorService.enrolled_methods(user)
         eligible = TwoFactorService.eligible_methods(user, used_primary_channel="password")
         return Response(
             {

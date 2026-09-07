@@ -23,7 +23,7 @@ from jwt_multiauth.factories import (
     UserFactory,
     VerifiedContactFactory,
 )
-from jwt_multiauth.models import RecoveryCode, TwoFactorDevice, VerifiedContact
+from jwt_multiauth.models import RecoveryCode, TrustedDevice, TwoFactorDevice, VerifiedContact
 from jwt_multiauth.services import InvalidPendingToken, TokenService, TwoFactorService
 
 #: A hard `import pyotp` at module scope would crash collection under the bare-install leg
@@ -253,6 +253,73 @@ def test_admin_force_disable_does_not_touch_verified_contact() -> None:
 def test_admin_force_disable_on_a_bare_account_is_a_no_op_not_an_error() -> None:
     user = UserFactory()
     TwoFactorService.admin_force_disable(user)  # must not raise
+
+
+# ----------------------------------------------------------------------- revoke_trusted_device
+
+
+def test_revoke_trusted_device_sets_revoked_at() -> None:
+    device = TrustedDeviceFactory(token_hash="1" * 64)
+    TwoFactorService.revoke_trusted_device(device)
+    device.refresh_from_db()
+    assert device.revoked_at is not None
+
+
+def test_revoke_trusted_device_is_idempotent() -> None:
+    already_revoked_at = timezone.now()
+    device = TrustedDeviceFactory(token_hash="2" * 64, revoked_at=already_revoked_at)
+    TwoFactorService.revoke_trusted_device(device)
+    device.refresh_from_db()
+    # Untouched — a second revoke must not overwrite the original revocation timestamp.
+    assert device.revoked_at == already_revoked_at
+
+
+def test_admin_force_disable_revokes_via_revoke_trusted_device_not_a_raw_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """admin_force_disable's own trusted-device sweep must go through
+    TwoFactorService.revoke_trusted_device per row, matching every other revoke path in this
+    package (never queryset.update()) — this is what makes a future trusted_device_revoked
+    signal addable in one place.
+    """
+    user = UserFactory()
+    device = TrustedDeviceFactory(user=user, token_hash="3" * 64)
+
+    calls: list[TrustedDevice] = []
+    monkeypatch.setattr(
+        TwoFactorService, "revoke_trusted_device", staticmethod(lambda d: calls.append(d))
+    )
+    TwoFactorService.admin_force_disable(user)
+
+    assert calls == [device]
+
+
+# -------------------------------------------------------------------------- enrolled_methods
+
+
+def test_enrolled_methods_includes_a_confirmed_totp_device() -> None:
+    user = UserFactory()
+    TwoFactorDeviceFactory(user=user, method="totp")
+    assert "totp" in TwoFactorService.enrolled_methods(user)
+
+
+def test_enrolled_methods_excludes_an_unconfirmed_totp_device() -> None:
+    user = UserFactory()
+    TwoFactorDeviceFactory(user=user, method="totp", confirmed_at=None)
+    assert "totp" not in TwoFactorService.enrolled_methods(user)
+
+
+@override_settings(JWT_MULTIAUTH={"USER_FIELDS": {"EMAIL_FIELD": "email"}})
+def test_enrolled_methods_includes_email_otp_for_a_verified_current_value() -> None:
+    user = UserFactory(email="alice@example.com")
+    VerifiedContactFactory(user=user, field="email", value="alice@example.com")
+    assert "email_otp" in TwoFactorService.enrolled_methods(user)
+
+
+def test_enrolled_methods_includes_recovery_code_when_an_unused_code_exists() -> None:
+    user = UserFactory()
+    RecoveryCodeFactory(user=user)
+    assert "recovery_code" in TwoFactorService.enrolled_methods(user)
 
 
 # ---------------------------------------------------------------------- generate_recovery_codes

@@ -428,6 +428,31 @@ def _resolve_user_for_login_attempt(identifier: str, *, method: str) -> Any | No
     return _resolve_user_for_channel(identifier, channel=channel)
 
 
+def _user_identifiers(user: Any) -> list[str]:
+    """Every non-empty value ``user`` currently has across the fields a login attempt could have
+    been recorded under — ``USER_FIELDS.IDENTIFIER_FIELDS`` (password login) plus
+    ``PHONE_FIELD``/``EMAIL_FIELD`` (OTP login) — deduped, order-preserving. A lockout is keyed by
+    whichever identifier was actually TYPED (``LockoutService``'s cache namespace is per-identifier,
+    not per-user), so ``LockoutService.unlock_user`` (Phase 8, ``docs/CONTRACT.md`` §11 deviation)
+    needs every value that could have been typed, not just ``USERNAME_FIELD``, or an admin
+    unlocking a user locked out via their email would see the account still locked.
+    """
+    user_fields = conf.get_setting("USER_FIELDS")
+    field_names = [
+        *user_fields["IDENTIFIER_FIELDS"],
+        user_fields["PHONE_FIELD"],
+        user_fields["EMAIL_FIELD"],
+    ]
+    seen: dict[str, None] = {}
+    for field_name in field_names:
+        if not field_name:
+            continue
+        value = getattr(user, field_name, "") or ""
+        if value:
+            seen.setdefault(str(value), None)
+    return list(seen)
+
+
 class UserProvisioningService:
     """docs/CONTRACT.md §11 item 19 — account creation for a phone/email-OTP identifier nobody
     has seen before, opt-in per method via ``USER_FIELDS.AUTO_PROVISION_METHODS``. Called only
@@ -1089,6 +1114,46 @@ class LockoutService:
         """
         invalidate_namespace(_lockout_identifier_namespace(identifier))
 
+    @staticmethod
+    def unlock_user(user: Any) -> list[str]:
+        """Admin-only caller (Phase 8, ``POST /admin/users/{id}/unlock/`` — ``docs/CONTRACT.md``
+        §11 deviation, since ``unlock`` itself takes a bare identifier, not a user, and the REST
+        route is keyed by user id). Calls :meth:`unlock` once per value in :func:`_user_identifiers`
+        — a lock is keyed by whichever identifier was typed, so unlocking only ``USERNAME_FIELD``
+        would leave a user still locked out under an email/phone they also could have typed.
+        Returns the identifiers it unlocked (possibly empty, for a user with no configured
+        identifier fields populated). Same ``LOCK_SCOPE="ip"`` no-op caveat as :meth:`unlock`
+        applies to every value in the list.
+        """
+        identifiers = _user_identifiers(user)
+        for identifier in identifiers:
+            LockoutService.unlock(identifier)
+        return identifiers
+
+    @staticmethod
+    def lock_status_for_user(user: Any) -> tuple[str, LockStatus | None]:
+        """Admin-only caller (Phase 8, ``GET /admin/users/{id}/security/`` — ``docs/CONTRACT.md``
+        §5 names the ``lock_status`` key without specifying its shape). Returns
+        ``(LOCKOUT["LOCK_SCOPE"], status)``.
+
+        Under ``LOCK_SCOPE="identifier"``, ``status`` is a REAL ``LockStatus`` — computed across
+        every value in :func:`_user_identifiers`, locked if ANY of them currently is — since
+        ``is_locked``'s own ``ip`` parameter is provably irrelevant to the answer under that scope
+        (``_lockout_keys`` never folds ``ip`` into the key there). Under
+        ``"identifier_and_ip"``/``"ip"``, returns ``(scope, None)``: no single IP answers "is this
+        USER locked?" at those scopes, and this app never asserts a security state it cannot
+        actually verify (this repo's ``CLAUDE.md`` rule 3) — never a possibly-wrong ``locked=False``
+        computed by passing a meaningless ``ip=""``.
+        """
+        scope = conf.get_setting("LOCKOUT")["LOCK_SCOPE"]
+        if scope != "identifier":
+            return scope, None
+        for identifier in _user_identifiers(user):
+            status = LockoutService.is_locked(identifier, ip="")
+            if status.locked:
+                return scope, status
+        return scope, LockStatus(locked=False, until=None)
+
 
 class VerificationService:
     """Contact-field (email/phone) verification for an ALREADY-authenticated user —
@@ -1311,6 +1376,33 @@ class TwoFactorService:
         return eligible
 
     @staticmethod
+    def enrolled_methods(user: Any) -> list[str]:
+        """What ``user`` has actually set up, independent of ``TWO_FACTOR["ALLOWED_METHODS"]`` —
+        a device enrolled before a host narrowed its allowlist still shows here. Phase 8 addition
+        (not in ``docs/CONTRACT.md``'s frozen §4 list — a §11 deviation), factored out of
+        ``views_twofactor.TwoFactorStatusView``'s own Phase 7 inline logic once
+        ``admin_views.AdminUserSecurityView`` needed the identical computation for an arbitrary
+        user, not just ``request.user`` — one definition rather than two copies that could drift.
+        """
+        user_fields = conf.get_setting("USER_FIELDS")
+        enrolled: list[str] = []
+        if TwoFactorDevice.objects.filter(
+            user=user, method="totp", confirmed_at__isnull=False, disabled_at__isnull=True
+        ).exists():
+            enrolled.append("totp")
+        for method, field in (("email_otp", "email"), ("phone_otp", "phone")):
+            field_name = user_fields["EMAIL_FIELD" if field == "email" else "PHONE_FIELD"]
+            value = getattr(user, field_name, "") if field_name else ""
+            if (
+                value
+                and VerifiedContact.objects.filter(user=user, field=field, value=value).exists()
+            ):
+                enrolled.append(method)
+        if RecoveryCode.objects.filter(user=user, used_at__isnull=True).exists():
+            enrolled.append("recovery_code")
+        return enrolled
+
+    @staticmethod
     def resolve_pending(pending_token: str) -> tuple[Any, dict[str, Any], list[str]]:
         """Resolves a ``pending_2fa`` token to ``(user, claims, eligible_methods)`` — shared by
         ``verify_second_factor`` and ``views_twofactor.TwoFactorOtpRequestView`` (the
@@ -1491,7 +1583,27 @@ class TwoFactorService:
                 sender=TwoFactorDevice, user_id=user.pk, method="recovery_code"
             )
 
-        TrustedDevice.objects.filter(user=user, revoked_at__isnull=True).update(revoked_at=now)
+        for device in TrustedDevice.objects.filter(user=user, revoked_at__isnull=True):
+            TwoFactorService.revoke_trusted_device(device)
+
+    @staticmethod
+    def revoke_trusted_device(device: TrustedDevice) -> None:
+        """Revokes a single ``TrustedDevice`` row — Phase 8, ``docs/CONTRACT.md`` §11 deviation
+        (not in the frozen §4 service list; ``TrustedDevice`` revocation had no service method of
+        its own before Phase 8's self-service/admin routes needed one to call through, mirroring
+        ``TokenService.revoke_session``'s "never a raw queryset ``.update()``" rule). Idempotent —
+        revoking an already-revoked device is a no-op, not an error. No ``reason`` parameter:
+        unlike ``AuthSession``, ``TrustedDevice`` has no ``revoked_reason`` column to write one
+        into (``models.py``). No dedicated signal fires here — there is no
+        ``trusted_device_revoked`` in ``docs/CONTRACT.md`` §3's frozen signal list — but every
+        caller (``admin_force_disable`` above, Phase 8's self-service/admin revoke views) goes
+        through this method rather than a raw ``.update()``, so a future signal has exactly one
+        call site to hook.
+        """
+        if device.revoked_at is not None:
+            return
+        device.revoked_at = timezone.now()
+        device.save(update_fields=["revoked_at"])
 
     @staticmethod
     def generate_recovery_codes(user: Any) -> list[str]:

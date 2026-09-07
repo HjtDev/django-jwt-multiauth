@@ -1584,6 +1584,47 @@ Everything not listed here is unchanged from
       already decided this ("since it's available regardless of which method is being
       disabled"); the guide's own Phase 7 prompt's "password OR current 2FA code, decide and
       document which" is superseded by that earlier decision, not re-opened here.
+26. **Phase 8 decisions, made because §4/§5 as written left them unresolved:**
+    - **`TwoFactorService.revoke_trusted_device(device: TrustedDevice) -> None`, a new method** —
+      no method existed to revoke a single `TrustedDevice` row before Phase 8's self-service and
+      admin revoke routes needed one to call through (matching `TokenService.revoke_session`'s
+      own "never a raw queryset `.update()`" rule). Idempotent; no `reason` parameter, since
+      unlike `AuthSession`, `TrustedDevice` has no `revoked_reason` column to write one into.
+      `admin_force_disable`'s own bulk `TrustedDevice` sweep now loops through this method instead
+      of a direct `.update(revoked_at=now)`, so there is exactly one revoke code path.
+    - **`LockoutService.unlock_user(user: Any) -> list[str]`, a new method** — `POST
+      /admin/users/{id}/unlock/` is keyed by user id, but `unlock(identifier: str)` takes a bare
+      identifier string and a lock is keyed by whichever identifier was actually typed. Loops a
+      new private `_user_identifiers(user)` helper (the deduped, non-empty values across
+      `USER_FIELDS.IDENTIFIER_FIELDS` + `PHONE_FIELD` + `EMAIL_FIELD`) and calls `unlock()` per
+      value, so a user locked out via their email is actually unlocked by an admin action that
+      only knows their user id. Returns the identifiers it unlocked.
+    - **`LockoutService.lock_status_for_user(user: Any) -> tuple[str, LockStatus | None]`, a new
+      method** — `GET /admin/users/{id}/security/`'s `lock_status` key is named by §5 but its
+      shape isn't specified anywhere. `is_locked(identifier, *, ip)` needs an `ip`, and under
+      `LOCKOUT["LOCK_SCOPE"]` of `"identifier_and_ip"`/`"ip"` there is no single correct `ip` for
+      "is this USER locked?" at all. Returns `(scope, status)`: a REAL `LockStatus` (computed
+      across every value in `_user_identifiers`) only under `LOCK_SCOPE="identifier"`, where `ip`
+      is provably irrelevant to the answer; `(scope, None)` otherwise — this app never asserts a
+      security state it cannot actually verify (this repo's `CLAUDE.md` rule 3), rather than
+      guessing `locked=False` from a meaningless `ip=""`. The admin view's own `lock_status`
+      response is `{scope, locked: bool | null, until: datetime | null}`.
+    - **`TwoFactorService.enrolled_methods(user: Any) -> list[str]`, a new method** — factored out
+      of `views_twofactor.TwoFactorStatusView`'s own Phase 7 inline logic once
+      `admin_views.AdminUserSecurityView` needed the identical "what has this user actually set
+      up" computation for an arbitrary user, not just `request.user`. One definition rather than
+      two copies that could drift; `TwoFactorStatusView` itself now calls this method too.
+    - **Session/trusted-device ownership is enforced structurally, via a `request.user`-filtered
+      `get_queryset()`, not `appkit.permissions.IsObjectOwner`.** `IsObjectOwner` only ever runs
+      from `GenericAPIView.get_object()`, downstream of the queryset lookup that already produced
+      the 404 for a foreign id — it can never be the mechanism that PRODUCES `404` over `403`
+      (§5's own review note), only a redundant second check on a row the queryset already proved
+      belongs to the caller. Not used at all in Phase 8's self-service session/trusted-device
+      views for this reason.
+    - **The Django-admin unlock action lives on `LoginAttemptAdmin`, not the `User` admin** — item
+      18's own text leaves the choice open. Lockout state is an `appkit.cache` counter with no
+      model row; a selected `LoginAttempt.identifier` is the EXACT string the counter was keyed
+      on, so this action needs no re-derivation a `User`-admin action would require.
 
 ---
 
