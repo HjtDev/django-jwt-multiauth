@@ -39,7 +39,14 @@ from django.utils import timezone
 from django.utils.module_loading import import_string
 
 from jwt_multiauth import conf, keys, otp, tokens
-from jwt_multiauth.models import AuthSession, LoginAttempt, OtpChallenge, VerifiedContact
+from jwt_multiauth.models import (
+    AuthSession,
+    LoginAttempt,
+    OtpChallenge,
+    RecoveryCode,
+    TwoFactorDevice,
+    VerifiedContact,
+)
 from jwt_multiauth.signals import (
     account_locked,
     contact_verified,
@@ -121,6 +128,18 @@ class ChallengeInvalid(Exception):
     view-level 400, details.code="otp_challenge_invalid") for every one of these causes — a decoy
     challenge_id's "doesn't resolve" case must read identically to a real-but-expired challenge's
     case (docs/CONTRACT.md §10).
+    """
+
+
+class TwoFactorUnavailable(Exception):
+    """Raised by TwoFactorService.eligible_methods()'s caller-side check (the login-response
+    helper, jwt_multiauth.login_flow, §5) when the intersection of enrolled methods,
+    TWO_FACTOR.ALLOWED_METHODS, and the different-channel rule is empty. Views map this to 401
+    with details.code="two_factor_unavailable" (appkit's fixed error-code set has no dedicated
+    top-level code for this — see docs/CONTRACT.md §10). NOT raised by eligible_methods itself,
+    which only ever returns a (possibly empty) list — the policy decision about what an empty
+    list MEANS belongs to the caller, since eligible_methods has no idea what
+    TWO_FACTOR["POLICY"] is being enforced.
     """
 
 
@@ -1113,3 +1132,94 @@ class VerificationService:
             field=challenge.channel,
             value=challenge.destination,
         )
+
+
+#: Maps a TWO_FACTOR["ALLOWED_METHODS"]/eligible-methods entry to the "channel" the
+#: different-channel rule compares it against — "password" is its own channel (2FA via email/
+#: phone is fully eligible after a password login); "recovery_code" has no channel of its own,
+#: since it is never subject to the different-channel filter directly (see eligible_methods).
+_METHOD_TO_CHANNEL: Final[dict[str, str]] = {
+    "totp": "totp",
+    "email_otp": "email",
+    "phone_otp": "phone",
+}
+
+
+class TwoFactorService:
+    """Second-factor enrollment, eligibility, and verification — docs/CONTRACT.md §4, Phase 7.
+    Only ``eligible_methods`` ships in Phase 6, since the login-response helper
+    (``jwt_multiauth.login_flow``) needs it before any enrollment surface exists at all; the rest
+    of this class (``enroll_totp``, ``confirm_totp``, ``disable``, ``admin_force_disable``,
+    ``generate_recovery_codes``, ``verify_second_factor``) lands in Phase 7.
+    """
+
+    @staticmethod
+    def eligible_methods(user: Any, *, used_primary_channel: str) -> list[str]:
+        """The set of second factors this user could satisfy right now, given how they just
+        logged in. Pure intersection — never raises, never consults TWO_FACTOR["POLICY"], since
+        POLICY governs what an empty (or non-empty) result MEANS to a caller, not what the
+        result itself is (docs/CONTRACT.md §4's own docstring: "eligible_methods()'s CALLER-side
+        check" raises TwoFactorUnavailable, not this method).
+
+        Resolution:
+
+        1. Start from TWO_FACTOR["ALLOWED_METHODS"].
+        2. Keep only methods the user has actually enrolled:
+           - "totp": a CONFIRMED, non-disabled TwoFactorDevice row exists. An unconfirmed
+             enrollment is never eligible.
+           - "email_otp"/"phone_otp": USER_FIELDS["EMAIL_FIELD"]/["PHONE_FIELD"] has a non-empty
+             current value on ``user`` AND a VerifiedContact row exists for that SAME current
+             value (not merely user+field) — changing the field's value silently un-enrolls it,
+             per VerifiedContact's own resolution rule (models.py).
+           - "recovery_code": deferred to step 4.
+        3. If TWO_FACTOR["REQUIRE_DIFFERENT_CHANNEL"], drop whichever surviving method maps to
+           ``used_primary_channel`` (see _METHOD_TO_CHANNEL) — "password" drops nothing, since no
+           2FA method's channel is ever "password".
+        4. THEN, and only then, add "recovery_code" back in if the user has at least one unused
+           RecoveryCode AND the list from step 3 is already non-empty. Applying this step LAST
+           (after the different-channel filter, not before) is what actually enforces
+           docs/CONTRACT.md §11 item 14's hard constraint — recovery codes are never the only
+           offered second factor. Applying it earlier would let the different-channel filter
+           strip the one real method the recovery-code check saw and leave
+           ``["recovery_code"]`` behind on its own.
+        """
+        allowed = conf.get_setting("TWO_FACTOR")["ALLOWED_METHODS"]
+        user_fields = conf.get_setting("USER_FIELDS")
+
+        eligible: list[str] = []
+        for method in allowed:
+            if method == "recovery_code":
+                continue  # handled last, step 4
+            if method == "totp":
+                enrolled = TwoFactorDevice.objects.filter(
+                    user=user, method="totp", confirmed_at__isnull=False, disabled_at__isnull=True
+                ).exists()
+            elif method in ("email_otp", "phone_otp"):
+                field = "email" if method == "email_otp" else "phone"
+                field_name = user_fields["EMAIL_FIELD" if field == "email" else "PHONE_FIELD"]
+                value = getattr(user, field_name, "") if field_name else ""
+                enrolled = (
+                    bool(value)
+                    and VerifiedContact.objects.filter(user=user, field=field, value=value).exists()
+                )
+            else:
+                enrolled = False
+            if enrolled:
+                eligible.append(method)
+
+        require_different_channel = conf.get_setting("TWO_FACTOR")["REQUIRE_DIFFERENT_CHANNEL"]
+        if require_different_channel:
+            eligible = [
+                method
+                for method in eligible
+                if _METHOD_TO_CHANNEL.get(method) != used_primary_channel
+            ]
+
+        if (
+            "recovery_code" in allowed
+            and eligible
+            and RecoveryCode.objects.filter(user=user, used_at__isnull=True).exists()
+        ):
+            eligible.append("recovery_code")
+
+        return eligible
