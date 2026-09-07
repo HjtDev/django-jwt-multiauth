@@ -80,6 +80,7 @@ DEFAULTS: Final[dict[str, Any]] = {
         "PENDING_TOKEN_TTL_SECONDS": 300,
         "RECOVERY_CODE_COUNT": 10,
         "TOTP_DRIFT_WINDOW": 1,
+        "TOTP_ISSUER": "",
         "TRUSTED_DEVICE": {
             "ENABLED": False,
             "TTL_SECONDS": 2_592_000,

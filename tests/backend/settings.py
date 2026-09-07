@@ -94,6 +94,7 @@ DEFAULT_THROTTLE_RATES = {
     throttling.TOKEN_VERIFY: "60/min",
     throttling.LOGOUT: "30/min",
     throttling.LOGOUT_ALL: "10/min",
+    throttling.TWO_FACTOR_OTP_REQUEST: "10/min",
     throttling.TWO_FACTOR_STATUS: "60/min",
     throttling.TWO_FACTOR_TOTP_ENROLL: "10/min",
     throttling.TWO_FACTOR_TOTP_CONFIRM: "10/min",
@@ -130,6 +131,15 @@ SPECTACULAR_SETTINGS = {
     "TITLE": "jwt_multiauth",
     "VERSION": "0.0.0",  # irrelevant here — the real version lives in pyproject.toml
     "COMPONENT_SPLIT_REQUEST": True,
+    # Phase 7 introduces two DIFFERENT "method" fields with different choice sets —
+    # TwoFactorDisableSerializer/TwoFactorVerifySerializer.method (all 4 TWO_FACTOR methods) vs
+    # TwoFactorOtpRequestSerializer.method (only the two OTP-based ones) — drf-spectacular can't
+    # auto-name both "MethodEnum", and --fail-on-warn treats its own auto-resolved collision name
+    # as an error. Named explicitly here rather than left to warn-and-mangle.
+    "ENUM_NAME_OVERRIDES": {
+        "TwoFactorMethodEnum": ["totp", "email_otp", "phone_otp", "recovery_code"],
+        "TwoFactorOtpRequestMethodEnum": ["email_otp", "phone_otp"],
+    },
 }
 
 # JWT_MULTIAUTH deliberately absent/empty — see module docstring.
@@ -137,5 +147,12 @@ JWT_MULTIAUTH: dict[str, Any] = {}
 
 # Fast hasher — this settings module is test-only, never shipped to a host.
 PASSWORD_HASHERS = ["django.contrib.auth.hashers.MD5PasswordHasher"]
+
+# A real, fixed Fernet key (`appkit.crypto.generate_key()`'s own output, pinned rather than
+# regenerated per test run so a failure is reproducible) — ambient default so every TOTP-touching
+# Phase 7 test doesn't need its own override_settings just to get keys.get_encryption_key() past
+# ImproperlyConfigured. test_checks.py's own E004 test still explicitly overrides this to None to
+# prove the unset-key path — an explicit override always wins over this module-level default.
+JWT_MULTIAUTH_ENCRYPTION_KEY = "3vY0nq6hFZ8xqQqzQwYV1JGgqgLzZ3n1KxG2y3fQxCk="
 
 STATIC_URL = "/static/"

@@ -3,6 +3,203 @@ info:
   title: jwt_multiauth
   version: 0.0.0
 paths:
+  /api/v1/auth/2fa/disable/:
+    post:
+      operationId: 2fa_disable_create
+      description: Requires the caller's current password as a re-auth step.
+      summary: Disable one enrolled 2FA method
+      tags:
+      - jwt-multiauth
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TwoFactorDisableRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/TwoFactorDisableRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/TwoFactorDisableRequest'
+        required: true
+      security:
+      - jwtMultiauthBearerAuth: []
+      responses:
+        '204':
+          description: No response body
+        '400':
+          description: method is not currently enrolled, or an incorrect password.
+  /api/v1/auth/2fa/otp/request/:
+    post:
+      operationId: 2fa_otp_request_create
+      description: |-
+        ``POST /2fa/otp/request/`` — not in ``docs/CONTRACT.md``'s frozen §5 table (see this
+        module's own docstring). Gated by the pending token itself rather than an identifier: no
+        decoy path applies, since the caller already proved a primary factor to obtain the pending
+        token in the first place — unlike ``/otp/request/``, there is no unauthenticated-identifier
+        enumeration surface here to protect.
+      summary: Request a two_factor-purpose OTP challenge for an eligible email_otp/phone_otp
+        second factor
+      tags:
+      - jwt-multiauth
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TwoFactorOtpRequestRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/TwoFactorOtpRequestRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/TwoFactorOtpRequestRequest'
+        required: true
+      security:
+      - jwtMultiauthBearerAuth: []
+      - {}
+      responses:
+        '200':
+          description: challenge_id, expires_at, resend_available_at.
+        '401':
+          description: Invalid/expired pending token, or method not eligible.
+  /api/v1/auth/2fa/recovery-codes/regenerate/:
+    post:
+      operationId: 2fa_recovery_codes_regenerate_create
+      description: Requires the caller's current password as a re-auth step. Returns
+        the PLAINTEXT codes once — never retrievable again.
+      summary: Regenerate the caller's recovery codes
+      tags:
+      - jwt-multiauth
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecoveryCodesRegenerateRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/RecoveryCodesRegenerateRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/RecoveryCodesRegenerateRequest'
+        required: true
+      security:
+      - jwtMultiauthBearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecoveryCodesResponse'
+          description: ''
+        '400':
+          description: Incorrect password.
+  /api/v1/auth/2fa/status/:
+    get:
+      operationId: 2fa_status_retrieve
+      description: '`enrolled_methods` is what the caller has actually set up; `eligible_methods`
+        is that set filtered by the host''s current TWO_FACTOR["ALLOWED_METHODS"].'
+      summary: Get the caller's own 2FA enrollment and eligibility status
+      tags:
+      - jwt-multiauth
+      security:
+      - jwtMultiauthBearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TwoFactorStatusResponse'
+          description: ''
+  /api/v1/auth/2fa/totp/confirm/:
+    post:
+      operationId: 2fa_totp_confirm_create
+      description: |-
+        ``POST /2fa/totp/confirm/``. Rejects a confirm attempt against an already-confirmed
+        device, or with no pending enrollment at all, with the same ``400`` shape as a wrong code —
+        every rejection here is a validation failure, never a distinguishable error.
+      summary: Confirm a pending TOTP enrollment
+      tags:
+      - jwt-multiauth
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TotpConfirmRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/TotpConfirmRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/TotpConfirmRequest'
+        required: true
+      security:
+      - jwtMultiauthBearerAuth: []
+      responses:
+        '204':
+          description: No response body
+        '400':
+          description: No pending enrollment, already confirmed, or an invalid code.
+  /api/v1/auth/2fa/totp/enroll/:
+    post:
+      operationId: 2fa_totp_enroll_create
+      description: Returns a plaintext secret and an otpauth:// URI, once. A prior
+        unconfirmed (or disabled) enrollment is silently replaced. Confirm with POST
+        /2fa/totp/confirm/ before this method counts toward eligible_methods.
+      summary: Start a TOTP enrollment
+      tags:
+      - jwt-multiauth
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TotpEnrollResponseRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/TotpEnrollResponseRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/TotpEnrollResponseRequest'
+        required: true
+      security:
+      - jwtMultiauthBearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TotpEnrollResponse'
+          description: ''
+  /api/v1/auth/2fa/verify/:
+    post:
+      operationId: 2fa_verify_create
+      description: Exactly one of `code`/`link_token` is required. `challenge_id`
+        is required for email_otp/phone_otp (obtained from POST /2fa/otp/request/).
+        The server re-derives eligible methods itself — a client-claimed `method`
+        not in that fresh set is rejected even if the client presents an otherwise-valid
+        code for it.
+      summary: Redeem a pending 2FA token with a second-factor code
+      tags:
+      - jwt-multiauth
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TwoFactorVerifyRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/TwoFactorVerifyRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/TwoFactorVerifyRequest'
+        required: true
+      security:
+      - jwtMultiauthBearerAuth: []
+      - {}
+      responses:
+        '200':
+          description: '{access, session_id, created}.'
+        '401':
+          description: Invalid/consumed pending token, or method not eligible/verified.
   /api/v1/auth/login/:
     post:
       operationId: login_create
@@ -410,6 +607,87 @@ components:
           minLength: 1
       required:
       - identifier
+    RecoveryCodesRegenerateRequest:
+      type: object
+      properties:
+        password:
+          type: string
+          writeOnly: true
+          minLength: 1
+      required:
+      - password
+    RecoveryCodesResponse:
+      type: object
+      description: The PLAINTEXT recovery codes — returned once, the same rule as
+        the TOTP secret.
+      properties:
+        codes:
+          type: array
+          items:
+            type: string
+      required:
+      - codes
+    TotpConfirmRequest:
+      type: object
+      properties:
+        code:
+          type: string
+          writeOnly: true
+          minLength: 1
+      required:
+      - code
+    TotpEnrollResponse:
+      type: object
+      description: |-
+        ``POST /2fa/totp/enroll/`` response. The ONE moment the plaintext secret is ever
+        returned — never present in any other response this app produces.
+      properties:
+        secret:
+          type: string
+        otpauth_uri:
+          type: string
+      required:
+      - otpauth_uri
+      - secret
+    TotpEnrollResponseRequest:
+      type: object
+      description: |-
+        ``POST /2fa/totp/enroll/`` response. The ONE moment the plaintext secret is ever
+        returned — never present in any other response this app produces.
+      properties:
+        secret:
+          type: string
+          minLength: 1
+        otpauth_uri:
+          type: string
+          minLength: 1
+      required:
+      - otpauth_uri
+      - secret
+    TwoFactorDisableRequest:
+      type: object
+      properties:
+        method:
+          $ref: '#/components/schemas/TwoFactorMethodEnum'
+        password:
+          type: string
+          writeOnly: true
+          minLength: 1
+      required:
+      - method
+      - password
+    TwoFactorMethodEnum:
+      enum:
+      - totp
+      - email_otp
+      - phone_otp
+      - recovery_code
+      type: string
+      description: |-
+        * `totp` - totp
+        * `email_otp` - email_otp
+        * `phone_otp` - phone_otp
+        * `recovery_code` - recovery_code
     TwoFactorMethods:
       type: object
       properties:
@@ -422,6 +700,82 @@ components:
       required:
       - allowed_methods
       - policy
+    TwoFactorOtpRequestMethodEnum:
+      enum:
+      - email_otp
+      - phone_otp
+      type: string
+      description: |-
+        * `email_otp` - email_otp
+        * `phone_otp` - phone_otp
+    TwoFactorOtpRequestRequest:
+      type: object
+      description: |-
+        ``POST /2fa/otp/request/`` — not in ``docs/CONTRACT.md``'s frozen §5 table, a Phase 7
+        addition recorded as a deviation in its §11 register: ``/2fa/verify/``'s frozen body has no
+        ``challenge_id`` of its own, and ``/otp/request/`` is hardcoded to ``purpose="login"``, so
+        ``email_otp``/``phone_otp`` as a SECOND factor needs its own request step, gated by the
+        pending token itself rather than an identifier (this endpoint never takes one).
+      properties:
+        pending_token:
+          type: string
+          minLength: 1
+        method:
+          $ref: '#/components/schemas/TwoFactorOtpRequestMethodEnum'
+      required:
+      - method
+      - pending_token
+    TwoFactorStatusResponse:
+      type: object
+      description: '``GET /2fa/status/`` response — ``docs/CONTRACT.md`` §5.'
+      properties:
+        policy:
+          type: string
+        enrolled_methods:
+          type: array
+          items:
+            type: string
+        eligible_methods:
+          type: array
+          items:
+            type: string
+      required:
+      - eligible_methods
+      - enrolled_methods
+      - policy
+    TwoFactorVerifyRequest:
+      type: object
+      description: |-
+        ``POST /2fa/verify/`` — ``docs/CONTRACT.md`` §5. Every method here needs exactly one of
+        ``code``/``link_token`` (``totp``/``recovery_code`` always via ``code``; ``email_otp``/
+        ``phone_otp`` via either, same magic-link-lives-here rule ``OtpVerifySerializer`` uses), so
+        the shared cross-field helper applies universally, not just to the OTP-based methods.
+        ``challenge_id`` is an addition beyond the frozen body (same §11 deviation as
+        ``TwoFactorOtpRequestSerializer`` above) — required only for ``"email_otp"``/``"phone_otp"``,
+        a method-conditional rule checked at the view layer rather than here.
+      properties:
+        pending_token:
+          type: string
+          minLength: 1
+        method:
+          $ref: '#/components/schemas/TwoFactorMethodEnum'
+        code:
+          type: string
+          writeOnly: true
+          minLength: 1
+        link_token:
+          type: string
+          writeOnly: true
+          minLength: 1
+        challenge_id:
+          type: string
+          minLength: 1
+        trust_device:
+          type: boolean
+          default: false
+      required:
+      - method
+      - pending_token
   securitySchemes:
     jwtMultiauthBearerAuth:
       type: http

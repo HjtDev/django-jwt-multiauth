@@ -2,21 +2,26 @@
 identifier with a wrong password produce byte-for-byte the same 401 body; a locked-out account
 never reaches ``PasswordService.authenticate`` at all; a successful login issues real tokens
 (with the refresh cookie set per ``REFRESH_COOKIE`` settings, or in the body under
-``TRANSPORT="body"``); and 2FA-enabled settings produce the ``pending_2fa`` shape instead.
+``TRANSPORT="body"``); 2FA-enabled settings produce the ``pending_2fa`` shape instead; and a valid
+``TrustedDevice`` cookie (Phase 7) skips the 2FA check entirely — checked BEFORE 2FA is even
+offered — while a revoked or expired one does not.
 """
 
 from __future__ import annotations
 
 import statistics
 import time
+from datetime import timedelta
 from unittest.mock import patch
 
 import pytest
 from django.core.cache import cache
 from django.test import override_settings
+from django.utils import timezone
 from rest_framework.test import APIClient
 
-from jwt_multiauth.factories import TwoFactorDeviceFactory, UserFactory
+from jwt_multiauth import keys, otp
+from jwt_multiauth.factories import TrustedDeviceFactory, TwoFactorDeviceFactory, UserFactory
 from jwt_multiauth.models import LoginAttempt
 from jwt_multiauth.services import PasswordService
 
@@ -209,6 +214,121 @@ def test_login_with_2fa_required_and_no_eligible_method_fails_closed(
     )
     assert response.status_code == 401
     assert response.json()["error"]["details"] == {"code": "two_factor_unavailable"}
+
+
+# ------------------------------------------------------------------------ trusted-device skip
+
+
+_TRUSTED_DEVICE_2FA_SETTINGS = {
+    "TWO_FACTOR": {
+        "POLICY": "required",
+        "ALLOWED_METHODS": ["totp"],
+        "TRUSTED_DEVICE": {"ENABLED": True},
+    }
+}
+
+
+@override_settings(JWT_MULTIAUTH=_TRUSTED_DEVICE_2FA_SETTINGS)
+def test_a_valid_trusted_device_cookie_skips_2fa_entirely(api_client: APIClient) -> None:
+    user = _make_user(username="alice")
+    TwoFactorDeviceFactory(user=user, method="totp")  # confirmed by the factory's own default
+    raw_token = "a-real-trusted-device-bearer-token"
+    device = TrustedDeviceFactory(
+        user=user, token_hash=otp.hash_secret(raw_token, pepper=keys.get_otp_pepper())
+    )
+    api_client.cookies["jwt_multiauth_td"] = raw_token
+
+    response = api_client.post(
+        _LOGIN_URL, {"identifier": "alice", "password": _PASSWORD}, format="json"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert "pending_token" not in body
+    assert "access" in body
+
+    device.refresh_from_db()
+    assert device.last_used_at is not None
+
+
+@override_settings(JWT_MULTIAUTH=_TRUSTED_DEVICE_2FA_SETTINGS)
+def test_a_revoked_trusted_device_cookie_does_not_skip_2fa(api_client: APIClient) -> None:
+    user = _make_user(username="alice")
+    TwoFactorDeviceFactory(user=user, method="totp")
+    raw_token = "a-revoked-trusted-device-bearer-token"
+    TrustedDeviceFactory(
+        user=user,
+        token_hash=otp.hash_secret(raw_token, pepper=keys.get_otp_pepper()),
+        revoked_at=timezone.now(),
+    )
+    api_client.cookies["jwt_multiauth_td"] = raw_token
+
+    response = api_client.post(
+        _LOGIN_URL, {"identifier": "alice", "password": _PASSWORD}, format="json"
+    )
+    assert response.status_code == 200
+    assert "pending_token" in response.json()
+
+
+@override_settings(JWT_MULTIAUTH=_TRUSTED_DEVICE_2FA_SETTINGS)
+def test_an_expired_trusted_device_cookie_does_not_skip_2fa(api_client: APIClient) -> None:
+    user = _make_user(username="alice")
+    TwoFactorDeviceFactory(user=user, method="totp")
+    raw_token = "an-expired-trusted-device-bearer-token"
+    TrustedDeviceFactory(
+        user=user,
+        token_hash=otp.hash_secret(raw_token, pepper=keys.get_otp_pepper()),
+        expires_at=timezone.now() - timedelta(seconds=1),
+    )
+    api_client.cookies["jwt_multiauth_td"] = raw_token
+
+    response = api_client.post(
+        _LOGIN_URL, {"identifier": "alice", "password": _PASSWORD}, format="json"
+    )
+    assert response.status_code == 200
+    assert "pending_token" in response.json()
+
+
+@override_settings(JWT_MULTIAUTH=_TRUSTED_DEVICE_2FA_SETTINGS)
+def test_a_foreign_trusted_device_cookie_does_not_skip_2fa(api_client: APIClient) -> None:
+    """A trusted-device cookie belonging to a DIFFERENT user must never skip 2FA for this one."""
+    user = _make_user(username="alice")
+    stranger = UserFactory(username="bob")
+    TwoFactorDeviceFactory(user=user, method="totp")
+    raw_token = "someone-elses-trusted-device-bearer-token"
+    TrustedDeviceFactory(
+        user=stranger, token_hash=otp.hash_secret(raw_token, pepper=keys.get_otp_pepper())
+    )
+    api_client.cookies["jwt_multiauth_td"] = raw_token
+
+    response = api_client.post(
+        _LOGIN_URL, {"identifier": "alice", "password": _PASSWORD}, format="json"
+    )
+    assert response.status_code == 200
+    assert "pending_token" in response.json()
+
+
+@override_settings(
+    JWT_MULTIAUTH={"TWO_FACTOR": {"POLICY": "required", "ALLOWED_METHODS": ["totp"]}}
+)
+def test_a_trusted_device_cookie_is_ignored_when_trusted_device_is_disabled(
+    api_client: APIClient,
+) -> None:
+    """TRUSTED_DEVICE["ENABLED"] defaults to False — a valid-looking cookie must not skip 2FA
+    when the feature itself is off.
+    """
+    user = _make_user(username="alice")
+    TwoFactorDeviceFactory(user=user, method="totp")
+    raw_token = "a-trusted-device-bearer-token"
+    TrustedDeviceFactory(
+        user=user, token_hash=otp.hash_secret(raw_token, pepper=keys.get_otp_pepper())
+    )
+    api_client.cookies["jwt_multiauth_td"] = raw_token
+
+    response = api_client.post(
+        _LOGIN_URL, {"identifier": "alice", "password": _PASSWORD}, format="json"
+    )
+    assert response.status_code == 200
+    assert "pending_token" in response.json()
 
 
 # The throttle-scope-per-endpoint tests live in test_views_throttling.py, one file covering
