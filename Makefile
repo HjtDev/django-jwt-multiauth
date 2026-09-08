@@ -7,8 +7,11 @@
 	docs-link messages compilemessages playground-up playground-down playground-logs \
 	playground-reset
 
-# The authoritative gate — celery extra installed, >=90% coverage (this repo's CLAUDE.md
-# Commands table, raised from the ecosystem's 85% because this app holds credentials). Port
+# The authoritative gate — totp/celery/channels extras installed, >=90% coverage (this repo's
+# CLAUDE.md Commands table, raised from the ecosystem's 85% because this app holds credentials).
+# channels is included so middleware/jwt_auth.py's Phase 9 tests are collected and counted
+# toward the coverage gate on a fresh clone, rather than silently depending on whatever a prior
+# `uv sync --extra channels` happened to leave in the shared venv. Port
 # 55435, not appkit/base-scaffold's 55432, cleanup_app's 55433, or django-dynamic-user's
 # 55434 — none of the four ephemeral Postgres instances may collide if every repo's `make test`
 # runs on the same machine at once.
@@ -18,7 +21,7 @@ test:
 	(cd backend && \
 	POSTGRES_HOST=localhost POSTGRES_PORT=55435 \
 	POSTGRES_DB=test_jwt_multiauth POSTGRES_USER=postgres POSTGRES_PASSWORD=postgres \
-	uv run --extra totp --extra celery pytest)
+	uv run --extra totp --extra celery --extra channels pytest)
 
 # The dynamic_user-host leg (this repo's CLAUDE.md Commands table) — proves the phone/email
 # field resolution actually works against a real subclassed model
