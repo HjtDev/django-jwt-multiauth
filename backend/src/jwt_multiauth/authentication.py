@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 from django.contrib.auth import get_user_model
+from django.utils.translation import gettext_lazy as _
 from drf_spectacular.extensions import OpenApiAuthenticationExtension
 from rest_framework.authentication import BaseAuthentication
 from rest_framework.exceptions import AuthenticationFailed
@@ -52,13 +53,13 @@ class JWTAuthentication(BaseAuthentication):
         try:
             claims = TokenService.verify_access_token(raw_token)
         except tokens.TokenError as exc:
-            raise AuthenticationFailed("Invalid or expired access token.") from exc
+            raise AuthenticationFailed(_("Invalid or expired access token.")) from exc
 
         user_model = get_user_model()
         try:
             user = user_model.objects.get(pk=claims["sub"])
         except (user_model.DoesNotExist, ValueError, TypeError) as exc:
-            raise AuthenticationFailed("Invalid or expired access token.") from exc
+            raise AuthenticationFailed(_("Invalid or expired access token.")) from exc
 
         return user, claims
 

@@ -124,6 +124,7 @@ uv run --exact pytest -m "not requires_extra" --no-cov   # bare-install check, n
 uv run ruff check --fix . ../tests && uv run ruff format . ../tests
 uv run mypy src
 uv build
+make messages && make compilemessages         # regenerate/compile locale/fa/LC_MESSAGES/django.{po,mo}
 
 cd frontend && npm ci
 npm run test                      # Vitest + MSW — authoritative gate for the TS half

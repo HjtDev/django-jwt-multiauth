@@ -24,6 +24,7 @@ from __future__ import annotations
 from typing import Any
 
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.utils.translation import gettext_lazy as _
 from drf_spectacular.utils import OpenApiResponse, extend_schema
 from rest_framework import generics
 from rest_framework.exceptions import AuthenticationFailed, ValidationError
@@ -61,7 +62,7 @@ def _require_password_reauth(user: Any, password: str) -> None:
     function so "reachable without re-auth" is one thing to audit, not two separate view bodies.
     """
     if not user.check_password(password):
-        raise ValidationError({"password": ["Incorrect password."]})
+        raise ValidationError({"password": [_("Incorrect password.")]})
 
 
 class TwoFactorStatusView(generics.GenericAPIView[Any]):
