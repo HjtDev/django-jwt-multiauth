@@ -1,0 +1,67 @@
+{
+  "name": "@hjtdev/django-jwt-multiauth",
+  "version": "1.0.0",
+  "description": "JWT auth SDK for django-jwt-multiauth — typed hooks over both the self-service (/api/v1/auth) and admin (/api/v1/admin/auth) surfaces, plus the secure token manager trio (authStore, authHeaderSource, withAuthRetry) a host wires into appkit's ApiClientProvider. Generated from the backend's own OpenAPI schema.",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HjtDev/django-jwt-multiauth.git",
+    "directory": "frontend"
+  },
+  "homepage": "https://github.com/HjtDev/django-jwt-multiauth#readme",
+  "bugs": "https://github.com/HjtDev/django-jwt-multiauth/issues",
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "react": ">=18",
+    "@tanstack/react-query": ">=5",
+    "@hjtdev/appkit": ">=2.0.0 <3.0.0"
+  },
+  "devDependencies": {
+    "@hjtdev/appkit": "^2.0.2",
+    "@tanstack/react-query": "^5.62.0",
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.1.0",
+    "@types/node": "^22.10.2",
+    "@types/react": "^19.0.4",
+    "@types/react-dom": "^19.0.2",
+    "@vitejs/plugin-react": "^4.3.4",
+    "@vitest/coverage-v8": "^4.1.10",
+    "eslint": "^9.17.0",
+    "eslint-config-prettier": "^9.1.0",
+    "eslint-plugin-react-hooks": "^5.1.0",
+    "jsdom": "^25.0.1",
+    "msw": "^2.7.0",
+    "openapi-typescript": "^7.13.0",
+    "prettier": "^3.4.2",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.2",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.19.0",
+    "vitest": "^4.1.10"
+  },
+  "scripts": {
+    "generate:types": "openapi-typescript ../backend/schema.yml -o src/schema.d.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "tsc -p tsconfig.build.json",
+    "test": "vitest",
+    "lint": "cd .. && eslint frontend/src tests/frontend",
+    "format": "cd .. && prettier --write frontend tests/frontend",
+    "format:check": "cd .. && prettier --check frontend tests/frontend"
+  }
+}
