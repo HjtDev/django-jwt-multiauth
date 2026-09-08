@@ -46,6 +46,7 @@ from typing import ClassVar
 
 from django.conf import settings
 from django.db import models
+from django.utils.translation import gettext_lazy as _
 
 
 class OtpChallenge(models.Model):  # noqa: DJ008 -- see module docstring
@@ -59,38 +60,66 @@ class OtpChallenge(models.Model):  # noqa: DJ008 -- see module docstring
     challenge identically (§10) regardless of which reason produced the null.
     """
 
-    challenge_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    challenge_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False, verbose_name=_("challenge ID")
+    )
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
         null=True,
         related_name="otp_challenges",
+        verbose_name=_("user"),
     )
-    channel = models.CharField(max_length=8, choices=[("email", "email"), ("phone", "phone")])
+    channel = models.CharField(
+        max_length=8,
+        choices=[("email", _("Email")), ("phone", _("Phone"))],
+        verbose_name=_("channel"),
+    )
     purpose = models.CharField(
         max_length=16,
         choices=[
-            ("login", "login"),
-            ("password_reset", "password_reset"),
-            ("verify_contact", "verify_contact"),
-            ("two_factor", "two_factor"),
+            ("login", _("Login")),
+            ("password_reset", _("Password reset")),
+            ("verify_contact", _("Verify contact")),
+            ("two_factor", _("Two-factor")),
         ],
+        verbose_name=_("purpose"),
     )
-    destination = models.CharField(max_length=255)  # the actual email/phone the code targeted
-    code_hash = models.CharField(max_length=64)  # written only by otp.hash_secret via OtpService
+    destination = models.CharField(
+        max_length=255,
+        verbose_name=_("destination"),
+        help_text=_("The actual email address or phone number the code was sent to."),
+    )
+    code_hash = models.CharField(
+        max_length=64, verbose_name=_("code hash")
+    )  # written only by otp.hash_secret via OtpService
     link_token_hash = models.CharField(  # noqa: DJ001 -- None vs "" must stay distinguishable, see module docstring
-        max_length=64, null=True, blank=True
+        max_length=64,
+        null=True,
+        blank=True,
+        verbose_name=_("link token hash"),
     )  # ditto, written only by otp.hash_secret via OtpService, EMIT_LINK_TOKEN only
-    attempts = models.PositiveSmallIntegerField(default=0)
-    max_attempts = models.PositiveSmallIntegerField()  # snapshotted from conf at creation time
-    resend_count = models.PositiveSmallIntegerField(default=0)
-    max_resends = models.PositiveSmallIntegerField()  # snapshotted from conf at creation time
-    last_sent_at = models.DateTimeField()  # updated by OtpService.resend; drives resend cooldown
-    created_at = models.DateTimeField(auto_now_add=True)
-    expires_at = models.DateTimeField()
-    consumed_at = models.DateTimeField(null=True, blank=True)
+    attempts = models.PositiveSmallIntegerField(default=0, verbose_name=_("attempts"))
+    max_attempts = models.PositiveSmallIntegerField(
+        verbose_name=_("max attempts"),
+        help_text=_("Snapshotted from configuration when the challenge was created."),
+    )
+    resend_count = models.PositiveSmallIntegerField(default=0, verbose_name=_("resend count"))
+    max_resends = models.PositiveSmallIntegerField(
+        verbose_name=_("max resends"),
+        help_text=_("Snapshotted from configuration when the challenge was created."),
+    )
+    last_sent_at = models.DateTimeField(
+        verbose_name=_("last sent at"),
+        help_text=_("Updated on every resend; drives the resend cooldown."),
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name=_("created at"))
+    expires_at = models.DateTimeField(verbose_name=_("expires at"))
+    consumed_at = models.DateTimeField(null=True, blank=True, verbose_name=_("consumed at"))
 
     class Meta:
+        verbose_name = _("OTP challenge")
+        verbose_name_plural = _("OTP challenges")
         indexes: ClassVar[list[models.Index]] = [
             models.Index(fields=["user", "purpose", "consumed_at"]),
             models.Index(fields=["expires_at"]),
@@ -108,34 +137,51 @@ class AuthSession(models.Model):  # noqa: DJ008 -- see module docstring
     same as TrustedDevice.last_used_at below.
     """
 
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    user = models.ForeignKey(
-        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="auth_sessions"
+    id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False, verbose_name=_("session ID")
     )
-    current_jti = models.CharField(max_length=64, unique=True)  # written only by TokenService
-    rotation_count = models.PositiveIntegerField(default=0)
-    device_label = models.CharField(max_length=255, blank=True)
-    ip_address = models.GenericIPAddressField()
-    user_agent = models.CharField(max_length=512, blank=True)
-    remember_me = models.BooleanField(default=False)
-    created_at = models.DateTimeField(auto_now_add=True)
-    last_used_at = models.DateTimeField(auto_now_add=True)
-    expires_at = models.DateTimeField()
-    revoked_at = models.DateTimeField(null=True, blank=True)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="auth_sessions",
+        verbose_name=_("user"),
+    )
+    current_jti = models.CharField(  # written only by TokenService
+        max_length=64,
+        unique=True,
+        verbose_name=_("current JTI"),
+        help_text=_("The refresh token's current JWT ID; replaced on every rotation."),
+    )
+    rotation_count = models.PositiveIntegerField(default=0, verbose_name=_("rotation count"))
+    device_label = models.CharField(max_length=255, blank=True, verbose_name=_("device label"))
+    ip_address = models.GenericIPAddressField(verbose_name=_("IP address"))
+    user_agent = models.CharField(max_length=512, blank=True, verbose_name=_("user agent"))
+    remember_me = models.BooleanField(
+        default=False,
+        verbose_name=_("remember me"),
+        help_text=_("Whether this session was issued a long-lived refresh token."),
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name=_("created at"))
+    last_used_at = models.DateTimeField(auto_now_add=True, verbose_name=_("last used at"))
+    expires_at = models.DateTimeField(verbose_name=_("expires at"))
+    revoked_at = models.DateTimeField(null=True, blank=True, verbose_name=_("revoked at"))
     revoked_reason = models.CharField(  # noqa: DJ001 -- None vs "" must stay distinguishable, see module docstring
         max_length=32,
         null=True,
         blank=True,
         choices=[
-            ("user_logout", "user_logout"),
-            ("admin_revoked", "admin_revoked"),
-            ("reuse_detected", "reuse_detected"),
-            ("password_changed", "password_changed"),
-            ("expired", "expired"),
+            ("user_logout", _("User logout")),
+            ("admin_revoked", _("Admin revoked")),
+            ("reuse_detected", _("Reuse detected")),
+            ("password_changed", _("Password changed")),
+            ("expired", _("Expired")),
         ],
+        verbose_name=_("revoked reason"),
     )
 
     class Meta:
+        verbose_name = _("auth session")
+        verbose_name_plural = _("auth sessions")
         indexes: ClassVar[list[models.Index]] = [
             models.Index(fields=["user", "revoked_at"]),
             models.Index(fields=["expires_at"]),
@@ -149,16 +195,29 @@ class TwoFactorDevice(models.Model):  # noqa: DJ008 -- see module docstring
     """
 
     user = models.ForeignKey(
-        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="two_factor_devices"
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="two_factor_devices",
+        verbose_name=_("user"),
     )
-    method = models.CharField(max_length=16, choices=[("totp", "totp")])
-    secret_encrypted = models.TextField()  # written only by TwoFactorService.enroll_totp (Fernet)
-    last_used_step = models.BigIntegerField(default=0)  # TOTP replay guard
-    created_at = models.DateTimeField(auto_now_add=True)
-    confirmed_at = models.DateTimeField(null=True, blank=True)
-    disabled_at = models.DateTimeField(null=True, blank=True)
+    method = models.CharField(
+        max_length=16, choices=[("totp", _("TOTP"))], verbose_name=_("method")
+    )
+    secret_encrypted = models.TextField(  # written only by TwoFactorService.enroll_totp (Fernet)
+        verbose_name=_("encrypted secret")
+    )
+    last_used_step = models.BigIntegerField(
+        default=0,
+        verbose_name=_("last used step"),
+        help_text=_("TOTP replay guard — the last time-step value that was accepted."),
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name=_("created at"))
+    confirmed_at = models.DateTimeField(null=True, blank=True, verbose_name=_("confirmed at"))
+    disabled_at = models.DateTimeField(null=True, blank=True, verbose_name=_("disabled at"))
 
     class Meta:
+        verbose_name = _("two-factor device")
+        verbose_name_plural = _("two-factor devices")
         constraints: ClassVar[list[models.BaseConstraint]] = [
             models.UniqueConstraint(fields=["user", "method"], name="unique_user_method_2fa_device")
         ]
@@ -171,13 +230,20 @@ class RecoveryCode(models.Model):  # noqa: DJ008 -- see module docstring
     """
 
     user = models.ForeignKey(
-        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="recovery_codes"
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="recovery_codes",
+        verbose_name=_("user"),
     )
-    code_hash = models.CharField(max_length=64)  # written only by otp.hash_secret, TwoFactorService
-    used_at = models.DateTimeField(null=True, blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
+    code_hash = models.CharField(  # written only by otp.hash_secret, TwoFactorService
+        max_length=64, verbose_name=_("code hash")
+    )
+    used_at = models.DateTimeField(null=True, blank=True, verbose_name=_("used at"))
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name=_("created at"))
 
     class Meta:
+        verbose_name = _("recovery code")
+        verbose_name_plural = _("recovery codes")
         indexes: ClassVar[list[models.Index]] = [models.Index(fields=["user", "used_at"])]
 
 
@@ -191,14 +257,27 @@ class VerifiedContact(models.Model):  # noqa: DJ008 -- see module docstring
     """
 
     user = models.ForeignKey(
-        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="verified_contacts"
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="verified_contacts",
+        verbose_name=_("user"),
     )
-    field = models.CharField(max_length=8, choices=[("email", "email"), ("phone", "phone")])
-    value = models.CharField(max_length=255)
-    verified_at = models.DateTimeField(auto_now_add=True)
-    created_at = models.DateTimeField(auto_now_add=True)
+    field = models.CharField(
+        max_length=8,
+        choices=[("email", _("Email")), ("phone", _("Phone"))],
+        verbose_name=_("field"),
+    )
+    value = models.CharField(
+        max_length=255,
+        verbose_name=_("value"),
+        help_text=_("The exact contact value that was verified."),
+    )
+    verified_at = models.DateTimeField(auto_now_add=True, verbose_name=_("verified at"))
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name=_("created at"))
 
     class Meta:
+        verbose_name = _("verified contact")
+        verbose_name_plural = _("verified contacts")
         constraints: ClassVar[list[models.BaseConstraint]] = [
             models.UniqueConstraint(
                 fields=["user", "field", "value"], name="unique_user_field_value_verified"
@@ -218,29 +297,42 @@ class LoginAttempt(models.Model):  # noqa: DJ008 -- see module docstring
         null=True,
         blank=True,
         related_name="login_attempts",
+        verbose_name=_("user"),
     )
-    identifier = models.CharField(max_length=255)
+    identifier = models.CharField(
+        max_length=255,
+        verbose_name=_("identifier"),
+        help_text=_("Stored in plaintext, deliberately, so an admin can search it."),
+    )
     method = models.CharField(
         max_length=16,
-        choices=[("password", "password"), ("email_otp", "email_otp"), ("phone_otp", "phone_otp")],
+        choices=[
+            ("password", _("Password")),
+            ("email_otp", _("Email OTP")),
+            ("phone_otp", _("Phone OTP")),
+        ],
+        verbose_name=_("method"),
     )
-    ip_address = models.GenericIPAddressField()
-    user_agent = models.CharField(max_length=512, blank=True)
-    success = models.BooleanField()
+    ip_address = models.GenericIPAddressField(verbose_name=_("IP address"))
+    user_agent = models.CharField(max_length=512, blank=True, verbose_name=_("user agent"))
+    success = models.BooleanField(verbose_name=_("success"))
     failure_reason = models.CharField(  # noqa: DJ001 -- None vs "" must stay distinguishable, see module docstring
         max_length=32,
         null=True,
         blank=True,
         choices=[
-            ("no_such_identifier", "no_such_identifier"),
-            ("wrong_credential", "wrong_credential"),
-            ("locked", "locked"),
-            ("two_factor_unavailable", "two_factor_unavailable"),
+            ("no_such_identifier", _("No such identifier")),
+            ("wrong_credential", _("Wrong credential")),
+            ("locked", _("Locked")),
+            ("two_factor_unavailable", _("Two-factor unavailable")),
         ],
+        verbose_name=_("failure reason"),
     )
-    created_at = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name=_("created at"))
 
     class Meta:
+        verbose_name = _("login attempt")
+        verbose_name_plural = _("login attempts")
         indexes: ClassVar[list[models.Index]] = [
             models.Index(fields=["identifier", "created_at"]),
             models.Index(fields=["ip_address", "created_at"]),
@@ -259,15 +351,20 @@ class TrustedDevice(models.Model):  # noqa: DJ008 -- see module docstring
     """
 
     user = models.ForeignKey(
-        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="trusted_devices"
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="trusted_devices",
+        verbose_name=_("user"),
     )
     # written only by otp.hash_secret, via TwoFactorService
-    token_hash = models.CharField(max_length=64, unique=True)
-    device_label = models.CharField(max_length=255, blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-    last_used_at = models.DateTimeField(auto_now_add=True)
-    expires_at = models.DateTimeField()
-    revoked_at = models.DateTimeField(null=True, blank=True)
+    token_hash = models.CharField(max_length=64, unique=True, verbose_name=_("token hash"))
+    device_label = models.CharField(max_length=255, blank=True, verbose_name=_("device label"))
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name=_("created at"))
+    last_used_at = models.DateTimeField(auto_now_add=True, verbose_name=_("last used at"))
+    expires_at = models.DateTimeField(verbose_name=_("expires at"))
+    revoked_at = models.DateTimeField(null=True, blank=True, verbose_name=_("revoked at"))
 
     class Meta:
+        verbose_name = _("trusted device")
+        verbose_name_plural = _("trusted devices")
         indexes: ClassVar[list[models.Index]] = [models.Index(fields=["user", "revoked_at"])]

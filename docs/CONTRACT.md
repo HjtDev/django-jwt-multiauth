@@ -1229,6 +1229,29 @@ is a `views_*.py` concern, not a new top-level code ever) — envelope shape
 `{"error": {"code", "message", "details", "request_id"}}`, unchanged from appkit's own contract
 (§11 item 9).
 
+**Localisation never touches a machine-readable value.** `error.code`, `error.details.code` (and
+every other `details` key), and the *value* half of every model `choices=` tuple are plain `str`
+literals, never `gettext_lazy`-wrapped, under any active locale — the ten-item `ERROR_CODES` set
+above, the `details.code` vocabulary, and the frozen choice values (`"email"`/`"phone"`,
+`revoked_reason`, `failure_reason`, etc.) are load-bearing for tests, the frontend SDK, and other
+`details.*`-keyed logic, and translating one would silently break all three depending on the
+active locale. What *does* localise: `error.message` (this app authors real prose for it in only a
+handful of places — `authentication.py`'s "Invalid or expired access token.",
+`views_twofactor.py`'s "Incorrect password.", `serializers.py`'s exactly-one-of validation
+message, and `services.py`'s "The old password is incorrect."; nearly every other failure reaches
+the client as a bare `{"code": ...}` `details` dict, which appkit itself renders as one of its own
+two already-translated generic `message` strings), every model's `Meta.verbose_name`/
+`verbose_name_plural`, every model field's `verbose_name`/`help_text`, and `choices=`
+*labels* (never their values). `checks.py`'s system-check messages, the management commands'
+`help`/stdout text, and every `OpenApiResponse(description=...)`/`summary=` in `views_*.py` are
+deliberately left untranslated — the schema strings in particular are force-str'd into the
+committed `backend/schema.yml` at generation time, so wrapping them would let a regeneration under
+a non-English locale silently rewrite a checked-in artifact. The package ships a complete Farsi
+(`fa`) catalogue (`locale/fa/LC_MESSAGES/django.{po,mo}`, `make messages`/`make compilemessages`),
+but activating a locale — `django.utils.translation`'s language selection, `LANGUAGES`,
+`django.middleware.locale.LocaleMiddleware` — is entirely the host's decision; this app performs
+no locale activation of its own.
+
 **A password change/reset revokes every OTHER session, unconditionally.**
 `PasswordService.change_password`/`.confirm_reset` both call
 `TokenService.revoke_all_sessions(..., reason="password_changed")` — `PASSWORD.REVOKE_SESSIONS_ON_CHANGE`

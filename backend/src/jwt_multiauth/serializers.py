@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 
 
@@ -316,6 +317,6 @@ def _validate_exactly_one_of_code_or_link_token(attrs: dict[str, Any]) -> dict[s
     has_link_token = bool(attrs.get("link_token"))
     if has_code == has_link_token:
         raise serializers.ValidationError(
-            "Exactly one of 'code' or 'link_token' is required.", code="exactly_one_required"
+            _("Exactly one of 'code' or 'link_token' is required."), code="exactly_one_required"
         )
     return attrs

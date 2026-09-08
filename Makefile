@@ -121,10 +121,12 @@ docs-link:
 	done
 	@echo "Linked $(words $(SHARED_DOCS)) shared docs from ../ecosystem-docs/ (all resolve)"
 
-# Regenerates locale/fa/LC_MESSAGES/django.po from source (admin.py, apps.py, models.py, and
-# the Phase 6 admin templates) — new translatable strings land as empty msgstr entries for a
-# translator to fill in; existing translations are preserved. Never run on its own before a
-# release: compilemessages below must follow, or the .po drifts from the shipped .mo.
+# Regenerates locale/fa/LC_MESSAGES/django.po from source (admin.py, apps.py, models.py,
+# authentication.py, serializers.py, services.py, views_twofactor.py — every gettext_lazy call
+# in the package; there are no HTML templates in this package to scan) — new translatable strings
+# land as empty msgstr entries for a translator to fill in; existing translations are preserved.
+# Never run on its own before a release: compilemessages below must follow, or the .po drifts
+# from the shipped .mo.
 messages:
 	cd backend/src/jwt_multiauth && uv run --project ../.. django-admin makemessages -l fa --no-obsolete
 

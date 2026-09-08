@@ -37,6 +37,7 @@ from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.db import transaction
 from django.utils import timezone
 from django.utils.module_loading import import_string
+from django.utils.translation import gettext_lazy as _
 
 from jwt_multiauth import conf, keys, otp, tokens
 from jwt_multiauth.models import (
@@ -880,7 +881,7 @@ class PasswordService:
         ``_finish_password_reset_or_change``.
         """
         if not user.check_password(old_password):
-            raise ValidationError("The old password is incorrect.", code="invalid_old_password")
+            raise ValidationError(_("The old password is incorrect."), code="invalid_old_password")
         _finish_password_reset_or_change(user, new_password)
 
     @staticmethod
@@ -1093,7 +1094,7 @@ class LockoutService:
         ``ImproperlyConfigured`` an unrecognized ``LOCK_SCOPE`` already raises from
         ``_lockout_keys``.
         """
-        _, lock_key = _lockout_keys(identifier, ip=ip)
+        _unused_attempts_key, lock_key = _lockout_keys(identifier, ip=ip)
         until_raw = cache.get(lock_key)
         if until_raw is None:
             return LockStatus(locked=False, until=None)
@@ -1530,7 +1531,9 @@ class TwoFactorService:
                     "No confirmed TOTP device to disable.", code="method_not_enrolled"
                 )
         elif method == "recovery_code":
-            deleted, _ = RecoveryCode.objects.filter(user=user, used_at__isnull=True).delete()
+            deleted, _per_model = RecoveryCode.objects.filter(
+                user=user, used_at__isnull=True
+            ).delete()
             if not deleted:
                 raise ValidationError(
                     "No unused recovery codes to disable.", code="method_not_enrolled"
@@ -1540,7 +1543,7 @@ class TwoFactorService:
             user_fields = conf.get_setting("USER_FIELDS")
             field_name = user_fields["EMAIL_FIELD" if field == "email" else "PHONE_FIELD"]
             value = getattr(user, field_name, "") if field_name else ""
-            deleted, _ = VerifiedContact.objects.filter(
+            deleted, _per_model = VerifiedContact.objects.filter(
                 user=user, field=field, value=value
             ).delete()
             if not deleted:
@@ -1577,7 +1580,9 @@ class TwoFactorService:
         if totp_disabled:
             two_factor_disabled.send(sender=TwoFactorDevice, user_id=user.pk, method="totp")
 
-        recovery_deleted, _ = RecoveryCode.objects.filter(user=user, used_at__isnull=True).delete()
+        recovery_deleted, _per_model = RecoveryCode.objects.filter(
+            user=user, used_at__isnull=True
+        ).delete()
         if recovery_deleted:
             two_factor_disabled.send(
                 sender=TwoFactorDevice, user_id=user.pk, method="recovery_code"
