@@ -861,7 +861,8 @@ states the mechanism, not just "yes."
 | `POST` | `/2fa/totp/confirm/` | `IsAuthenticated` | `jwt_multiauth_2fa_totp_confirm` | N/A | `{code}` → `204`, or `400` |
 | `POST` | `/2fa/disable/` | `IsAuthenticated`, re-auth required (password OR current 2FA code, decided and documented once here: **password re-entry**, since it's available regardless of which method is being disabled) | `jwt_multiauth_2fa_disable` | N/A | `{method, password}` → `204`, or `400`/`403` |
 | `POST` | `/2fa/recovery-codes/regenerate/` | `IsAuthenticated`, re-auth required (password, same reasoning) | `jwt_multiauth_2fa_recovery_regenerate` | N/A | `{password}` → `200 {codes: [...]}` (plaintext, once) |
-| `POST` | `/2fa/verify/` | `AllowAny` (gated by the pending token itself — intentionally reachable pre-full-login) | `jwt_multiauth_2fa_verify` | N/A (pending-token scoped, not identifier-scoped) | `{pending_token, method, code? or link_token?, trust_device?}` → `200 {access, session_id}`, or `401` (`TwoFactorUnavailable`/`InvalidPendingToken`) |
+| `POST` | `/2fa/otp/request/` | `AllowAny` (gated by the pending token itself, same reasoning as `/2fa/verify/` below) | `jwt_multiauth_2fa_otp_request` | N/A (pending-token scoped, not identifier-scoped — no decoy path) | `{pending_token, method}` (`method` ∈ `email_otp`\|`phone_otp`) → `200 {challenge_id, expires_at, resend_available_at}`, or `401` (`TwoFactorUnavailable`/`InvalidPendingToken`) — added by §11 item 25, not in this table's original frozen form; issues the `challenge_id` `/2fa/verify/` needs for its OTP-based methods |
+| `POST` | `/2fa/verify/` | `AllowAny` (gated by the pending token itself — intentionally reachable pre-full-login) | `jwt_multiauth_2fa_verify` | N/A (pending-token scoped, not identifier-scoped) | `{pending_token, method, code? or link_token?, challenge_id? (required for email_otp/phone_otp), trust_device?}` → `200 {access, session_id, created: false}`, or `401` (`TwoFactorUnavailable`/`InvalidPendingToken`) |
 | `GET` | `/sessions/` | `IsAuthenticated` | `jwt_multiauth_sessions_list` | N/A | — → `200` paginated (`appkit.pagination.DefaultPagination`), CALLER's own `AuthSession` rows only, filtered at the queryset level |
 | `DELETE` | `/sessions/{id}/` | `IsAuthenticated` + ownership check (own row only) | `jwt_multiauth_sessions_revoke` | N/A | — → `204`, or `404` if the session id doesn't belong to the caller (chosen over `403` — see §5 review note below) |
 | `GET` | `/trusted-devices/` | `IsAuthenticated` | `jwt_multiauth_trusted_devices_list` | N/A | — → `200` paginated, CALLER's own `TrustedDevice` rows only |
@@ -1013,9 +1014,12 @@ Two config hooks, two managers, two key-factory roots — one per basePath (`jwt
 | `useConfirmTotp()` | `POST /2fa/totp/confirm/` | — (mutation, never fires on mount) | `jwtMultiauthKeys.twoFactorStatus()` |
 | `useDisableTwoFactor()` | `POST /2fa/disable/` | — (mutation, never fires on mount) | `jwtMultiauthKeys.twoFactorStatus()` |
 | `useRegenerateRecoveryCodes()` | `POST /2fa/recovery-codes/regenerate/` | — (mutation, never fires on mount) | — |
+| `useRequestTwoFactorOtp()` | `POST /2fa/otp/request/` | — (mutation, never fires on mount) | — |
 | `useVerifyTwoFactor()` | `POST /2fa/verify/` | — (mutation, never fires on mount) | — |
 | `useRequestContactVerification()` | `POST /account/verify-contact/request/` | — (mutation, never fires on mount) | — |
 | `useConfirmContactVerification()` | `POST /account/verify-contact/confirm/` | — (mutation, never fires on mount) | — |
+| `useVerifyToken()` | `POST /token/verify/` | — (mutation, never fires on mount) | — |
+| `useRefreshToken()` | `POST /token/refresh/` | — (mutation, never fires on mount) | — |
 
 ### Admin
 
@@ -1033,6 +1037,9 @@ Two config hooks, two managers, two key-factory roots — one per basePath (`jwt
 `useTrustedDevices`/`useRevokeTrustedDevice` and their admin equivalents are added beyond the
 guide's item 7 list (§11 item 2 — dedicated endpoints, decided with the user). `useAuthState` is
 added beyond the guide's list too (§11 item 13 — Phase 10 mandates it, item 7 omitted it).
+`useRequestTwoFactorOtp`, `useVerifyToken`, and `useRefreshToken` are Phase 10 additions beyond
+this table's originally frozen form (§11 item 27 — the first closes a real gap, the other two are
+completeness additions with a steer-elsewhere doc comment on the normal-use path).
 
 ### The manager/hook two-layer split
 
@@ -1063,17 +1070,29 @@ identical shape to every other app in this ecosystem.
   source to fail **loudly** on a real bug, and "not logged in" is explicitly not a bug; the two are
   distinguished in the implementation, not conflated.
 - **`withAuthRetry.ts`** — `withAuthRetry(client: HttpClient): HttpClient`, an `HttpClient`
-  decorator: a `401` triggers exactly one refresh attempt and one retry of the original call; a
-  second `401` (refresh itself failed, or the retry also `401`s) propagates the error and calls
-  `authStore.clear()` + broadcasts `"logged-out"`. **This is the concrete satisfaction of appkit
-  CONTRACT §J's explicit assignment of retry-on-401 to the host's concrete client** — appkit itself
-  contains no retry-on-401 mechanism anywhere (§16 rule 6), and this app's own README (Phase 12)
-  states that fact so a host never expects appkit to provide it.
+  decorator: a `401` triggers exactly one refresh attempt and one retry of the original call,
+  sending the FRESHLY refreshed token on the retry (never the stale header the original call
+  carried — appkit merges `headerSources` into a request's headers once, before this decorator
+  ever runs, so reusing that same `init` on retry would just repeat the same `401`); a second
+  `401` (refresh itself failed, or the retry also `401`s) propagates the error and calls
+  `authStore.clear()` + broadcasts `"logged-out"`. The retry calls the RAW, undecorated `client`
+  directly, never the returned wrapper, so an infinite loop is structurally impossible rather than
+  merely counter-guarded. **This is the concrete satisfaction of appkit CONTRACT §J's explicit
+  assignment of retry-on-401 to the host's concrete client** — appkit itself contains no
+  retry-on-401 mechanism anywhere (§16 rule 6), and this app's own README (Phase 12) states that
+  fact so a host never expects appkit to provide it.
+- **`refresh.ts`'s `configureAuth(overrides: Partial<AuthConfig>): void`** — Phase 10 addition,
+  §11 item 27. `authHeaderSource.ts`/`withAuthRetry.ts` run outside any component tree and cannot
+  call `useApiClient` to learn where a host mounted this app's self-service surface, but that
+  mount point is the host's own choice, never a value this package may hard-code. A host that
+  mounted anywhere other than the default `/api/v1/auth` calls `configureAuth({ refreshUrl, ... })`
+  once, next to where it mounts `ApiClientProvider`, so the refresh manager's own
+  `POST /token/refresh/` call reaches the right place.
 
 `index.ts` exports the hooks, both key factories, this app's own types, **and** — the deliberate,
 documented exception to "never export the manager/config hook" — `useAuthState`,
-`authHeaderSource`, and `withAuthRetry`: host wiring a host cannot construct itself, unlike the
-managers, which stay internal.
+`authHeaderSource`, `withAuthRetry`, **and `configureAuth`**: host wiring a host cannot construct
+itself, unlike the managers, which stay internal.
 
 **Requires another app package: No** (`appkit`'s `HttpClient`/`HeaderSource`/`ApiClientProvider`/
 `useApiClient` are the declared peer-dependency exception).
@@ -1648,6 +1667,51 @@ Everything not listed here is unchanged from
       18's own text leaves the choice open. Lockout state is an `appkit.cache` counter with no
       model row; a selected `LoginAttempt.identifier` is the EXACT string the counter was keyed
       on, so this action needs no re-derivation a `User`-admin action would require.
+27. **Phase 10 decisions, made because §5/§7 as written left them unresolved:**
+    - **`POST /2fa/otp/request/` gets a hook — `useRequestTwoFactorOtp()`.** §5's frozen
+      self-service table doesn't carry this row (item 25 already added the endpoint itself, but
+      §7's hook table was never updated to match) and §7's hook table names none for it. Without
+      one, `email_otp`/`phone_otp` as a SECOND factor is unreachable from the frontend at all —
+      `useVerifyTwoFactor` needs a `challenge_id` only this endpoint issues. §5's table is amended
+      with the missing row below; §7's table gains the corresponding hook.
+    - **`useVerifyToken()` and `useRefreshToken()` added, beyond §7's frozen list, for
+      completeness — confirmed with the user.** §7 deliberately omits a refresh hook (the token
+      trio owns refresh via its own single-flight `refresh.ts`, not a react-query mutation), and
+      frames `/token/verify/` as service-to-service. Both endpoints still needed a manager method
+      for "every feature has an API with a frontend hook/manager" to hold; both hooks carry a doc
+      comment steering a host toward the trio's own mechanism instead for the normal case.
+    - **`configureAuth()` added as a 4th `index.ts` export, beyond the token-manager trio's three
+      (`useAuthState`/`authHeaderSource`/`withAuthRetry`) — confirmed with the user.**
+      `authHeaderSource.ts`/`withAuthRetry.ts` run outside any component tree — they cannot call
+      `useApiClient` to learn the mount point a host chose for this app's self-service surface,
+      but that mount point is the host's choice (`APP-DESIGN.md` §12's "SDK-to-host client
+      contract"), never a value this package may hard-code. `configureAuth({ refreshUrl, ... })`
+      is how a host wired anywhere other than the default `/api/v1/auth` tells the refresh manager
+      where to find `POST /token/refresh/`. Same "deliberate, documented exception" comment block
+      in `index.ts` covers this export too.
+    - **The access token's expiry is derived client-side from the token's own `exp` claim, never
+      read off a response field.** Item 17 states the frontend token manager needs
+      `TokenPair.expires_at`, but no self-service response serializer (`LoginTokensResponseSerializer`,
+      `TokenRefreshResponseSerializer`) actually carries one, and adding one is a backend
+      (serializer) change outside this phase's scope. `jwt.ts`'s `readTokenExpiry` base64url-decodes
+      the payload segment — read-only introspection, never signature verification; the backend
+      stays the sole verifier of every token, and a wrong or undecodable `exp` here only ever
+      degrades to "refreshes more eagerly than strictly necessary," never to a security decision.
+    - **Cookie transport only — the frontend SDK never reads, stores, or sends a refresh token,
+      even though the backend supports `REFRESH_COOKIE["TRANSPORT"] = "body"` for native clients
+      — confirmed with the user.** A `refresh` field present in a response body under body
+      transport is simply never read by any manager method or the trio; the README states body
+      transport is unsupported from a browser host, matching the frontend security checklist's
+      "no secret stored recoverably" carried over from this repo's own `CLAUDE.md` rule 4.
+    - **`BroadcastChannel`'s `"token-refreshed"` event NOTIFIES subscribers only; it never causes
+      the receiving tab to clear or attempt its own refresh.** The trio's contract paragraph
+      doesn't specify receiver behaviour, only that the token itself is never carried. Having a
+      receiving tab immediately re-refresh on this event would turn N open tabs into N refresh
+      calls every time any ONE of them rotates — a self-inflicted stampede against
+      `POST /token/refresh/`. Each tab re-derives its own token lazily, only when ITS OWN token is
+      actually found to be missing or expiring, which is what `authHeaderSource.ts` already does
+      regardless of any cross-tab event; the event exists only so a `useAuthState()`-driven UI can
+      react to "some tab is authenticated" without polling.
 
 ---
 

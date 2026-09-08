@@ -1,0 +1,8 @@
+{
+  "name": "django-jwt-multiauth-repo",
+  "private": true,
+  "description": "Workspace root — hoists frontend/'s dependencies to a node_modules directory that is an ancestor of both frontend/ and tests/frontend/, mirroring ../appkit's and ../django-dynamic-user's own workspace roots. Phase 11 adds playground/default/frontend and playground/dynamic_user/frontend as two more members (docs/APP-DESIGN.md §11.2/§12) so both playground hosts and frontend/ (the SDK under test) share ONE physical copy of react/@tanstack/react-query/@hjtdev/appkit — the duplicate-copy hazard §12 documents. Not published; carries no dependencies of its own.",
+  "workspaces": [
+    "frontend"
+  ]
+}
